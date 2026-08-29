@@ -70,11 +70,16 @@ def heading(stdscr, view):
 
 def status_badge(state):
     return {
-        "working": "● working",
-        "done": "✓ done",
-        "blocked": "! blocked",
-        None: "· no agent",
+        "working": ("● working", 1),
+        "done": ("✓ done", 2),
+        "blocked": ("! blocked", 3),
+        None: ("· no agent", 0),
     }[state]
+
+
+def status_line(state):
+    text, pair = status_badge(state)
+    return text, curses.color_pair(pair) if pair else curses.A_DIM
 
 
 def forest(stdscr):
@@ -82,10 +87,14 @@ def forest(stdscr):
     for index, tree in enumerate(STATE["worktrees"]):
         row = 6 + index * 4
         joint = "└─" if index == len(STATE["worktrees"]) - 1 else "├─"
-        add(stdscr, row, 2, f"{joint} {tree['branch']}", curses.A_BOLD)
+        branch_attr = curses.A_BOLD if tree["branch"] == "main" else 0
+        add(stdscr, row, 2, f"{joint} {tree['branch']}", branch_attr)
         issue = tree["issue"] or "No linked issue"
         add(stdscr, row + 1, 6, f"issue  {issue}")
-        add(stdscr, row + 2, 6, f"agent  {tree['agent'] or '—'}  {status_badge(tree['agent_state'])}")
+        prefix = f"agent  {tree['agent'] or '—'}  "
+        add(stdscr, row + 2, 6, prefix)
+        text, attr = status_line(tree["agent_state"])
+        add(stdscr, row + 2, 6 + len(prefix), text, attr)
     add(stdscr, 23, 2, "Read this as: branch → issue → agent. Empty links are visible gaps.", curses.A_DIM)
 
 
@@ -106,16 +115,21 @@ def lanes(stdscr):
             add(stdscr, row, col, tree["branch"], curses.A_BOLD)
             add(stdscr, row + 1, col, "─" * (column_width - 3), curses.A_DIM)
             add(stdscr, row + 2, col, tree["issue"] or "No linked issue")
-            add(stdscr, row + 3, col, status_badge(tree["agent_state"]))
+            text, attr = status_line(tree["agent_state"])
+            add(stdscr, row + 3, col, text, attr)
             add(stdscr, row + 4, col, tree["agent"] or "No agent", curses.A_DIM)
     add(stdscr, 23, 2, "Read this as: what needs attention now. Branch structure comes second.", curses.A_DIM)
 
 
 def dependency_map(stdscr):
     add(stdscr, 4, 2, "WORKTREES", curses.A_BOLD)
+    markers = {"working": ("●", 1), "done": ("✓", 2), "blocked": ("!", 3), None: ("·", 0)}
     for index, tree in enumerate(STATE["worktrees"]):
-        marker = "●" if tree["agent_state"] == "working" else "!" if tree["agent_state"] == "blocked" else "·"
-        add(stdscr, 6 + index * 2, 2, f"{marker} {tree['branch']}")
+        marker, pair = markers[tree["agent_state"]]
+        attr = curses.color_pair(pair) if pair else curses.A_DIM
+        if tree["branch"] == "main":
+            attr |= curses.A_BOLD
+        add(stdscr, 6 + index * 2, 2, f"{marker} {tree['branch']}", attr)
 
     add(stdscr, 4, 38, "WAYFINDER / COPSE V1", curses.A_BOLD)
     add(stdscr, 6, 38, "[Research Herdr observation] ──┐", curses.A_DIM)
@@ -158,6 +172,10 @@ def draw(stdscr, view_index, show_state):
 def app(stdscr):
     curses.curs_set(0)
     stdscr.keypad(True)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_BLUE, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_RED, -1)
     view_index = 0
     show_state = False
     while True:
