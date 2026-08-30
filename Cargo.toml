@@ -1,6 +1,6 @@
 [package]
 name = "copse"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Terminal board for tracking work across worktrees"
 authors = ["zacd1302-ops"]
