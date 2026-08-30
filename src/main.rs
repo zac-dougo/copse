@@ -1,4 +1,5 @@
 mod discovery;
+mod herdr;
 mod tracker;
 
 use clap::Parser;
