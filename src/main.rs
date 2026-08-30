@@ -1,3 +1,4 @@
+mod app;
 mod discovery;
 mod forest;
 mod herdr;
@@ -13,8 +14,13 @@ use clap::Parser;
 )]
 struct Cli {}
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let _cli = Cli::parse();
-    // Scaffold: no board logic yet. Printing version proves the binary runs.
-    println!("copse {}", env!("CARGO_PKG_VERSION"));
+    let cwd = std::env::current_dir()?;
+    if let Err(e) = app::run(cwd).await {
+        eprintln!("copse: {e}");
+        std::process::exit(1);
+    }
+    Ok(())
 }
