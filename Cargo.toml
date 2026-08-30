@@ -2,6 +2,13 @@
 name = "copse"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal board for tracking work across worktrees"
+authors = ["zacd1302-ops"]
+license = "MIT"
+repository = "https://github.com/zacd1302-ops/copse"
+readme = "README.md"
+keywords = ["terminal", "git", "worktree", "tui"]
+categories = ["development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
