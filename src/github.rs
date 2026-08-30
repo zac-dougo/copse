@@ -1,0 +1,744 @@
+#![allow(dead_code)]
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::process::Command;
+
+use serde::Deserialize;
+use thiserror::Error;
+
+const ISSUE_FIELDS: &str = "number,title,state,body,labels,assignees,blockedBy,parent,subIssues";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueState {
+    Open,
+    Closed,
+}
+
+impl IssueState {
+    fn parse(value: &str) -> Result<Self, GitHubError> {
+        match value.to_ascii_lowercase().as_str() {
+            "open" => Ok(Self::Open),
+            "closed" => Ok(Self::Closed),
+            other => Err(GitHubError::InvalidState(other.to_string())),
+        }
+    }
+}
+
+impl std::fmt::Display for IssueState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open => write!(f, "open"),
+            Self::Closed => write!(f, "closed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubIssue {
+    pub number: u64,
+    pub title: String,
+    pub state: IssueState,
+    pub body: String,
+    pub labels: Vec<String>,
+    pub assignees: Vec<String>,
+    pub open_blockers: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontierState {
+    Frontier,
+    Blocked,
+    Assigned,
+    Done,
+}
+
+impl std::fmt::Display for FrontierState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Frontier => write!(f, "frontier"),
+            Self::Blocked => write!(f, "blocked"),
+            Self::Assigned => write!(f, "assigned"),
+            Self::Done => write!(f, "done"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WayfinderChild {
+    pub issue: GitHubIssue,
+    pub state: FrontierState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WayfinderMap {
+    pub issue: GitHubIssue,
+    pub children: Vec<WayfinderChild>,
+    pub open_child_count: usize,
+}
+
+pub type MapData = Vec<WayfinderMap>;
+
+#[derive(Debug, Error)]
+pub enum GitHubError {
+    #[error("gh not found: {0}")]
+    NotFound(String),
+    #[error("gh command failed: {0}")]
+    CommandFailed(String),
+    #[error("failed to parse GitHub issues: {0}")]
+    Parse(#[from] serde_json::Error),
+    #[error("unknown GitHub issue state: {0}")]
+    InvalidState(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssue {
+    number: u64,
+    title: String,
+    state: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    labels: Vec<RawLabel>,
+    #[serde(default)]
+    assignees: Vec<RawAssignee>,
+    #[serde(default, rename = "blockedBy")]
+    blocked_by: Option<RawConnection>,
+    #[serde(default)]
+    parent: Option<RawReference>,
+    #[serde(default, rename = "subIssues")]
+    sub_issues: Option<RawConnection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLabel {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAssignee {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawConnection {
+    #[serde(default)]
+    nodes: Vec<RawReference>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawReference {
+    number: u64,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IssueRecord {
+    issue: GitHubIssue,
+    native_blockers: Vec<RawBlocker>,
+    parent: Option<u64>,
+    sub_issues: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct RawBlocker {
+    number: u64,
+    state: Option<String>,
+}
+
+pub fn classify_issue(issue: &GitHubIssue) -> FrontierState {
+    match issue.state {
+        IssueState::Closed => FrontierState::Done,
+        IssueState::Open if !issue.open_blockers.is_empty() => FrontierState::Blocked,
+        IssueState::Open if !issue.assignees.is_empty() => FrontierState::Assigned,
+        IssueState::Open => FrontierState::Frontier,
+    }
+}
+
+pub fn default_map_index(maps: &[WayfinderMap]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (index, map) in maps.iter().enumerate() {
+        let replace = match best {
+            None => true,
+            Some(best_index) => {
+                let current = &maps[best_index];
+                map.open_child_count > current.open_child_count
+                    || (map.open_child_count == current.open_child_count
+                        && map.issue.number < current.issue.number)
+            }
+        };
+        if replace {
+            best = Some(index);
+        }
+    }
+    best
+}
+
+pub fn map_index_for_number(maps: &[WayfinderMap], selected_number: Option<u64>) -> Option<usize> {
+    selected_number
+        .and_then(|number| maps.iter().position(|map| map.issue.number == number))
+        .or_else(|| default_map_index(maps))
+}
+
+pub fn fetch_wayfinder_maps(cwd: &Path) -> Result<MapData, GitHubError> {
+    let output = Command::new("gh")
+        .current_dir(cwd)
+        .args([
+            "issue",
+            "list",
+            "--state",
+            "all",
+            "--limit",
+            "1000",
+            "--json",
+            ISSUE_FIELDS,
+        ])
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                GitHubError::NotFound(error.to_string())
+            } else {
+                GitHubError::Io(error)
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(GitHubError::CommandFailed(stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_wayfinder_maps(&stdout)
+}
+
+pub fn parse_wayfinder_maps(json: &str) -> Result<MapData, GitHubError> {
+    let raw_issues: Vec<RawIssue> = serde_json::from_str(json)?;
+    let records = raw_issues
+        .into_iter()
+        .map(IssueRecord::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let by_number: HashMap<u64, IssueRecord> = records
+        .iter()
+        .cloned()
+        .map(|record| (record.issue.number, record))
+        .collect();
+
+    let mut maps = Vec::new();
+    for record in records.iter().filter(|record| {
+        record
+            .issue
+            .labels
+            .iter()
+            .any(|label| label == "wayfinder:map")
+    }) {
+        let child_numbers = child_numbers(record, &records);
+        let children = child_numbers
+            .into_iter()
+            .filter_map(|number| by_number.get(&number))
+            .map(|child| {
+                let mut issue = child.issue.clone();
+                issue.open_blockers = resolve_open_blockers(child, &by_number);
+                let state = classify_issue(&issue);
+                WayfinderChild { issue, state }
+            })
+            .collect::<Vec<_>>();
+
+        maps.push(WayfinderMap {
+            issue: record.issue.clone(),
+            open_child_count: children
+                .iter()
+                .filter(|child| child.issue.state == IssueState::Open)
+                .count(),
+            children,
+        });
+    }
+
+    maps.sort_by_key(|map| map.issue.number);
+    Ok(maps)
+}
+
+impl TryFrom<RawIssue> for IssueRecord {
+    type Error = GitHubError;
+
+    fn try_from(raw: RawIssue) -> Result<Self, Self::Error> {
+        let state = IssueState::parse(&raw.state)?;
+        let labels = raw.labels.into_iter().map(|label| label.name).collect();
+        let assignees = raw
+            .assignees
+            .into_iter()
+            .map(|assignee| assignee.login)
+            .collect();
+        let native_blockers = raw
+            .blocked_by
+            .unwrap_or(RawConnection { nodes: Vec::new() })
+            .nodes
+            .into_iter()
+            .map(|reference| RawBlocker {
+                number: reference.number,
+                state: reference.state,
+            })
+            .collect();
+        let parent = raw.parent.map(|reference| reference.number);
+        let sub_issues = raw
+            .sub_issues
+            .unwrap_or(RawConnection { nodes: Vec::new() })
+            .nodes
+            .into_iter()
+            .map(|reference| reference.number)
+            .collect();
+
+        Ok(Self {
+            issue: GitHubIssue {
+                number: raw.number,
+                title: raw.title,
+                state,
+                body: raw.body.unwrap_or_default(),
+                labels,
+                assignees,
+                open_blockers: Vec::new(),
+            },
+            native_blockers,
+            parent,
+            sub_issues,
+        })
+    }
+}
+
+fn child_numbers(map: &IssueRecord, records: &[IssueRecord]) -> Vec<u64> {
+    if !map.sub_issues.is_empty() {
+        return dedupe(map.sub_issues.clone());
+    }
+
+    let task_list = parse_task_list_numbers(&map.issue.body);
+    if !task_list.is_empty() {
+        return dedupe(task_list);
+    }
+
+    let mut fallback = records
+        .iter()
+        .filter(|record| {
+            record.parent == Some(map.issue.number)
+                || has_part_of_marker(&record.issue.body, map.issue.number)
+        })
+        .map(|record| record.issue.number)
+        .collect::<Vec<_>>();
+    fallback.sort_unstable();
+    dedupe(fallback)
+}
+
+fn resolve_open_blockers(record: &IssueRecord, by_number: &HashMap<u64, IssueRecord>) -> Vec<u64> {
+    let mut blockers = HashSet::new();
+
+    for blocker in &record.native_blockers {
+        if blocker.state.as_deref().map(is_open_state).unwrap_or(true) {
+            blockers.insert(blocker.number);
+        }
+    }
+
+    for number in parse_blocked_by_numbers(&record.issue.body) {
+        match by_number.get(&number) {
+            Some(blocker) if blocker.issue.state == IssueState::Closed => {}
+            Some(_) | None => {
+                blockers.insert(number);
+            }
+        }
+    }
+
+    let mut result = blockers.into_iter().collect::<Vec<_>>();
+    result.sort_unstable();
+    result
+}
+
+fn is_open_state(state: &str) -> bool {
+    state.eq_ignore_ascii_case("open")
+}
+
+fn parse_task_list_numbers(body: &str) -> Vec<u64> {
+    let mut numbers = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        let bytes = trimmed.as_bytes();
+        if bytes.len() < 5
+            || !matches!(bytes[0], b'-' | b'*')
+            || bytes[1] != b' '
+            || bytes[2] != b'['
+            || !matches!(bytes[3], b' ' | b'x' | b'X')
+            || bytes[4] != b']'
+        {
+            continue;
+        }
+        numbers.extend(parse_issue_references(&trimmed[5..]));
+    }
+    numbers
+}
+
+fn parse_blocked_by_numbers(body: &str) -> Vec<u64> {
+    let mut numbers = Vec::new();
+    for line in body.lines().take(12) {
+        let lower = line.to_ascii_lowercase();
+        if let Some(index) = lower.find("blocked by:") {
+            numbers.extend(parse_issue_references(&line[index + "blocked by:".len()..]));
+        }
+    }
+    dedupe(numbers)
+}
+
+fn parse_issue_references(text: &str) -> Vec<u64> {
+    let bytes = text.as_bytes();
+    let mut numbers = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let start = if bytes[index] == b'#' {
+            Some(index + 1)
+        } else if bytes[index..].starts_with(b"/issues/") {
+            Some(index + b"/issues/".len())
+        } else {
+            None
+        };
+        if let Some(start) = start {
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start
+                && let Ok(number) = text[start..end].parse::<u64>()
+            {
+                numbers.push(number);
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    numbers
+}
+
+fn has_part_of_marker(body: &str, map_number: u64) -> bool {
+    let expected = format!("part of #{map_number}");
+    body.lines()
+        .take(6)
+        .any(|line| line.to_ascii_lowercase().contains(&expected))
+}
+
+fn dedupe(numbers: Vec<u64>) -> Vec<u64> {
+    let mut seen = HashSet::new();
+    numbers
+        .into_iter()
+        .filter(|number| seen.insert(*number))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn issue(
+        number: u64,
+        title: &str,
+        state: IssueState,
+        assignees: &[&str],
+        open_blockers: &[u64],
+    ) -> GitHubIssue {
+        GitHubIssue {
+            number,
+            title: title.to_string(),
+            state,
+            body: String::new(),
+            labels: Vec::new(),
+            assignees: assignees.iter().map(|name| (*name).to_string()).collect(),
+            open_blockers: open_blockers.to_vec(),
+        }
+    }
+
+    #[test]
+    fn frontier_state_uses_blockers_before_assignees() {
+        assert_eq!(
+            classify_issue(&issue(1, "ready", IssueState::Open, &[], &[])),
+            FrontierState::Frontier
+        );
+        assert_eq!(
+            classify_issue(&issue(2, "blocked", IssueState::Open, &[], &[9])),
+            FrontierState::Blocked
+        );
+        assert_eq!(
+            classify_issue(&issue(3, "claimed", IssueState::Open, &["zac"], &[])),
+            FrontierState::Assigned
+        );
+        assert_eq!(
+            classify_issue(&issue(4, "closed", IssueState::Closed, &["zac"], &[9])),
+            FrontierState::Done
+        );
+        assert_eq!(
+            classify_issue(&issue(
+                5,
+                "blocked and claimed",
+                IssueState::Open,
+                &["zac"],
+                &[9]
+            )),
+            FrontierState::Blocked
+        );
+    }
+
+    #[test]
+    fn parses_sub_issue_order_and_uppercase_states() {
+        let json = r#"
+        [
+          {
+            "number": 1,
+            "title": "Copse",
+            "state": "CLOSED",
+            "body": "",
+            "labels": [{"name":"wayfinder:map"}],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[{"number":3},{"number":2}],"totalCount":2}
+          },
+          {
+            "number": 2,
+            "title": "Second",
+            "state": "OPEN",
+            "body": "",
+            "labels": [{"name":"wayfinder:task"}],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": {"number":1},
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 3,
+            "title": "First",
+            "state": "CLOSED",
+            "body": "",
+            "labels": [{"name":"wayfinder:research"}],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": {"number":1},
+            "subIssues": {"nodes":[],"totalCount":0}
+          }
+        ]
+        "#;
+
+        let maps = parse_wayfinder_maps(json).unwrap();
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            maps[0]
+                .children
+                .iter()
+                .map(|child| child.issue.number)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(maps[0].children[0].state, FrontierState::Done);
+        assert_eq!(maps[0].children[1].state, FrontierState::Frontier);
+    }
+
+    #[test]
+    fn parses_task_list_fallback_and_ignores_checkbox_state() {
+        let json = r#"
+        [
+          {
+            "number": 10,
+            "title": "Build",
+            "state": "CLOSED",
+            "body": "- [x] #12\n- [ ] #11\n",
+            "labels": [{"name":"wayfinder:map"}],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 11,
+            "title": "Open issue",
+            "state": "OPEN",
+            "body": "",
+            "labels": [],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 12,
+            "title": "Closed issue",
+            "state": "CLOSED",
+            "body": "",
+            "labels": [],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          }
+        ]
+        "#;
+
+        let maps = parse_wayfinder_maps(json).unwrap();
+        assert_eq!(
+            maps[0]
+                .children
+                .iter()
+                .map(|child| child.issue.number)
+                .collect::<Vec<_>>(),
+            vec![12, 11]
+        );
+        assert_eq!(maps[0].open_child_count, 1);
+    }
+
+    #[test]
+    fn resolves_native_and_fallback_blockers_conservatively() {
+        let json = r#"
+        [
+          {
+            "number": 1,
+            "title": "Map",
+            "state": "OPEN",
+            "body": "- [ ] #4",
+            "labels": [{"name":"wayfinder:map"}],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 4,
+            "title": "Child",
+            "state": "OPEN",
+            "body": "Blocked by: #2, [#3](https://github.com/x/y/issues/3), #99.\nDetails",
+            "labels": [],
+            "assignees": [],
+            "blockedBy": {"nodes":[
+              {"number":5,"state":"OPEN"},
+              {"number":6,"state":"CLOSED"}
+            ],"totalCount":2},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 2,
+            "title": "Open blocker",
+            "state": "OPEN",
+            "body": "",
+            "labels": [],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 3,
+            "title": "Closed blocker",
+            "state": "CLOSED",
+            "body": "",
+            "labels": [],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 5,
+            "title": "Native open blocker",
+            "state": "OPEN",
+            "body": "",
+            "labels": [],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 6,
+            "title": "Native closed blocker",
+            "state": "CLOSED",
+            "body": "",
+            "labels": [],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          }
+        ]
+        "#;
+
+        let maps = parse_wayfinder_maps(json).unwrap();
+        assert_eq!(maps[0].children[0].issue.open_blockers, vec![2, 5, 99]);
+        assert_eq!(maps[0].children[0].state, FrontierState::Blocked);
+    }
+
+    #[test]
+    fn parses_references_after_unicode_text() {
+        assert_eq!(
+            parse_issue_references("→ résumé /issues/12 and #13"),
+            vec![12, 13]
+        );
+    }
+
+    #[test]
+    fn part_of_fallback_orders_by_issue_number() {
+        let json = r#"
+        [
+          {
+            "number": 10,
+            "title": "Map",
+            "state": "OPEN",
+            "body": "No task list",
+            "labels": [{"name":"wayfinder:map"}],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 12,
+            "title": "Twelve",
+            "state": "OPEN",
+            "body": "Part of #10\n",
+            "labels": [],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 11,
+            "title": "Eleven",
+            "state": "CLOSED",
+            "body": "Part of #10\n",
+            "labels": [],
+            "assignees": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          }
+        ]
+        "#;
+
+        let maps = parse_wayfinder_maps(json).unwrap();
+        assert_eq!(
+            maps[0]
+                .children
+                .iter()
+                .map(|child| child.issue.number)
+                .collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+    }
+
+    #[test]
+    fn default_map_prefers_open_children_then_lowest_number() {
+        let make_map = |number, open_child_count| WayfinderMap {
+            issue: issue(number, "map", IssueState::Closed, &[], &[]),
+            children: Vec::new(),
+            open_child_count,
+        };
+        let maps = vec![make_map(10, 2), make_map(1, 2), make_map(2, 1)];
+        assert_eq!(default_map_index(&maps), Some(1));
+        assert_eq!(map_index_for_number(&maps, Some(10)), Some(0));
+        assert_eq!(map_index_for_number(&maps, Some(99)), Some(1));
+    }
+}

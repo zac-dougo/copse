@@ -2,7 +2,7 @@
 
 Terminal board for tracking work across worktrees.
 
-Copse is a read-only board that shows one repository's worktrees, local issues, and live Herdr agents. It runs in a Herdr pane and also works outside Herdr without live agent state.
+Copse is a read-only board that shows one repository's worktrees, local issues, live Herdr agents, and Wayfinder maps. It runs in a Herdr pane and also works outside Herdr without live agent state.
 
 ## Install
 
@@ -33,9 +33,11 @@ copse
 
 Keys:
 
+- `1` Forest, `2` or `m` Map
+- `Tab` cycle Wayfinder maps
 - `↑` / `↓` move selection
-- `←` / `→` collapse, expand, or move to parent/child
-- `Enter` toggle detail pane
+- `←` / `→` collapse, expand, or move to parent/child in Forest
+- `Enter` toggle the selected Issue's detail pane
 - `r` refresh all sources now
 - `?` toggle help
 - `Esc` close detail or help
@@ -89,14 +91,17 @@ Branch names are derived from the linked worktree's Git metadata. Agent associat
 
 ## Board
 
-Forest layout: branch → issue → agent. The main branch is bold. Agent statuses are `idle`, `working`, `blocked`, `done`, and `unknown`. Display uses both text and a symbol:
+Forest layout is branch → Issue → Agent. The main branch is bold. Agent statuses are `idle`, `working`, `blocked`, `done`, and `unknown`. Display uses both text and a symbol:
 
 - working blue `●`
-- idle or done green `●`
-- blocked red `●`
-- unknown gray `○`
+- done green `✓`
+- idle green `○`
+- blocked red `!`
+- unknown gray `·`
 
-The board is one screen with a detail pane for the selected item.
+Map layout is a selected Wayfinder map grouped into Frontier, Blocked, Assigned, and Done sections. Frontier means an open Issue with no open blocker and no assignee. The Map view shows Wayfinder Issues only. It does not add Worktree or Agent context. The map with the most open children is selected first; `Tab` cycles through other maps. Copse reads maps with `gh issue list`; if GitHub is unavailable, the last good map remains visible and the status bar marks it stale.
+
+Both views can open a detail pane for the selected Issue.
 
 ## Refresh
 
@@ -124,7 +129,8 @@ Tests cover tracker parsing, repository discovery, Herdr snapshot parsing, fores
 - Started in a linked worktree shows the same board and all worktrees.
 - Missing `.copse` starts without issues and does not create files until the first write.
 - Outside a Git worktree prints an error and exits.
-- Forest shows branches, linked issues, and agents with correct statuses and colors.
+- Forest shows branches, linked Issues, and Agents with correct statuses and colors.
+- Map shows Wayfinder Issues grouped by frontier state and keeps map order within each section.
 - Keys and mouse work as listed, and refresh intervals behave as above.
 
 ## Stack

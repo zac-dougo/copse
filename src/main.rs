@@ -1,6 +1,7 @@
 mod app;
 mod discovery;
 mod forest;
+mod github;
 mod herdr;
 mod map;
 mod tracker;

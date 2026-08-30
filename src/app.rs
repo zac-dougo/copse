@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::discovery::{BoardRepository, discover};
 use crate::forest::{Forest, ForestWidget, build_forest, render_markdown_to_text};
+use crate::github::{MapData, default_map_index, fetch_wayfinder_maps, map_index_for_number};
 use crate::herdr::{Snapshot, fetch_snapshot_blocking};
 use crate::map::MapWidget;
 use crate::tracker::{load_issues, load_links};
@@ -61,6 +62,10 @@ pub struct App {
     pub show_detail: bool,
     pub status_msg: String,
     pub view: View,
+    pub map_data: MapData,
+    pub selected_map: usize,
+    pub selected_map_child: usize,
+    pub stale_github: bool,
 }
 
 impl App {
@@ -70,6 +75,11 @@ impl App {
         let links = load_links(&board.links_dir).unwrap_or_default();
         let snapshot = fetch_snapshot_blocking().unwrap_or_default();
         let forest = build_forest(board.worktrees.clone(), issues, links, &snapshot);
+        let (map_data, stale_github) = match fetch_wayfinder_maps(&cwd) {
+            Ok(maps) => (maps, false),
+            Err(_) => (MapData::new(), true),
+        };
+        let selected_map = default_map_index(&map_data).unwrap_or(0);
 
         let mut expanded_branches: HashSet<PathBuf> = HashSet::new();
         for b in &forest.branches {
@@ -99,7 +109,12 @@ impl App {
             show_detail: false,
             status_msg: String::new(),
             view: View::Forest,
+            map_data,
+            selected_map,
+            selected_map_child: 0,
+            stale_github,
         };
+        app.selected_map_child = app.first_map_child();
         app.rebuild_flat();
         Ok(app)
     }
@@ -132,7 +147,12 @@ impl App {
             show_detail: false,
             status_msg: String::new(),
             view: View::Forest,
+            map_data: MapData::new(),
+            selected_map: 0,
+            selected_map_child: 0,
+            stale_github: false,
         };
+        app.selected_map_child = app.first_map_child();
         app.rebuild_flat();
         app
     }
@@ -191,15 +211,95 @@ impl App {
     }
 
     pub fn move_up(&mut self) {
+        if self.view == View::Map {
+            let order = self.map_child_order();
+            if let Some(position) = order
+                .iter()
+                .position(|index| *index == self.selected_map_child)
+                && position > 0
+            {
+                self.selected_map_child = order[position - 1];
+            }
+            return;
+        }
         if self.selected > 0 {
             self.selected -= 1;
         }
     }
 
     pub fn move_down(&mut self) {
+        if self.view == View::Map {
+            let order = self.map_child_order();
+            if let Some(position) = order
+                .iter()
+                .position(|index| *index == self.selected_map_child)
+                && position + 1 < order.len()
+            {
+                self.selected_map_child = order[position + 1];
+            }
+            return;
+        }
         if self.selected + 1 < self.flat_nodes.len() {
             self.selected += 1;
         }
+    }
+
+    fn map_child_order(&self) -> Vec<usize> {
+        let Some(map) = self.map_data.get(self.selected_map) else {
+            return Vec::new();
+        };
+        [
+            crate::github::FrontierState::Frontier,
+            crate::github::FrontierState::Blocked,
+            crate::github::FrontierState::Assigned,
+            crate::github::FrontierState::Done,
+        ]
+        .into_iter()
+        .flat_map(|state| {
+            map.children
+                .iter()
+                .enumerate()
+                .filter(move |(_, child)| child.state == state)
+                .map(|(index, _)| index)
+        })
+        .collect()
+    }
+
+    fn first_map_child(&self) -> usize {
+        self.map_child_order().into_iter().next().unwrap_or(0)
+    }
+
+    fn next_map(&mut self) {
+        if self.map_data.len() < 2 {
+            return;
+        }
+        self.selected_map = (self.selected_map + 1) % self.map_data.len();
+        self.selected_map_child = self.first_map_child();
+    }
+
+    fn current_map_child(&self) -> Option<&crate::github::WayfinderChild> {
+        self.map_data
+            .get(self.selected_map)
+            .and_then(|map| map.children.get(self.selected_map_child))
+    }
+
+    fn replace_map_data(&mut self, map_data: MapData) {
+        let selected_map_number = self
+            .map_data
+            .get(self.selected_map)
+            .map(|map| map.issue.number);
+        let selected_child_number = self.current_map_child().map(|child| child.issue.number);
+        self.map_data = map_data;
+        self.selected_map = map_index_for_number(&self.map_data, selected_map_number).unwrap_or(0);
+        self.selected_map_child = selected_child_number
+            .and_then(|number| {
+                self.map_data.get(self.selected_map).and_then(|map| {
+                    map.children
+                        .iter()
+                        .position(|child| child.issue.number == number)
+                })
+            })
+            .unwrap_or_else(|| self.first_map_child());
     }
 
     pub fn toggle_expand(&mut self) {
@@ -268,6 +368,9 @@ impl App {
 
         if self.show_detail && key.code == KeyCode::Esc {
             self.show_detail = false;
+            return false;
+        }
+        if self.view == View::Map && matches!(key.code, KeyCode::Left | KeyCode::Right) {
             return false;
         }
 
@@ -369,7 +472,9 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                self.show_detail = !self.show_detail;
+                if self.view == View::Forest || self.current_map_child().is_some() {
+                    self.show_detail = !self.show_detail;
+                }
             }
             KeyCode::Char('r') => {
                 self.status_msg = "refresh requested".to_string();
@@ -378,8 +483,15 @@ impl App {
             KeyCode::Char('?') => {
                 self.show_help = true;
             }
-            KeyCode::Char('1') => self.view = View::Forest,
-            KeyCode::Char('2') | KeyCode::Char('m') => self.view = View::Map,
+            KeyCode::Char('1') => {
+                self.view = View::Forest;
+                self.show_detail = false;
+            }
+            KeyCode::Char('2') | KeyCode::Char('m') => {
+                self.view = View::Map;
+                self.show_detail = false;
+            }
+            KeyCode::Tab if self.view == View::Map => self.next_map(),
             KeyCode::Char('q') => return true,
             KeyCode::Esc if self.show_detail => {
                 self.show_detail = false;
@@ -396,21 +508,23 @@ impl App {
     pub fn refresh(&mut self) {
         // Reload local data and Herdr snapshot.
         // Keep last good on failure.
+        let mut local_ok = true;
         let issues = load_issues(&self.board.issues_dir).unwrap_or_else(|_| {
-            self.stale_local = true;
+            local_ok = false;
             Vec::new()
         });
         let links = load_links(&self.board.links_dir).unwrap_or_else(|_| {
-            self.stale_local = true;
+            local_ok = false;
             Vec::new()
         });
 
-        // Refresh board discovery for worktrees (in case new worktree added)
+        // Refresh board discovery for worktrees (in case a new worktree was added).
         if let Ok(new_board) = discover(&self.cwd) {
             self.board = new_board;
         } else {
-            self.stale_local = true;
+            local_ok = false;
         }
+        self.stale_local = !local_ok;
 
         match fetch_snapshot_blocking() {
             Ok(snap) => {
@@ -434,7 +548,19 @@ impl App {
         }
         self.rebuild_flat();
         self.last_herdr = Instant::now();
-        self.stale_local = false;
+    }
+
+    pub fn refresh_github(&mut self) {
+        self.last_github = Instant::now();
+        match fetch_wayfinder_maps(&self.cwd) {
+            Ok(map_data) => {
+                self.replace_map_data(map_data);
+                self.stale_github = false;
+            }
+            Err(_) => {
+                self.stale_github = true;
+            }
+        }
     }
 
     pub fn needs_herdr_refresh(&self) -> bool {
@@ -473,6 +599,12 @@ pub fn draw_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
     if app.stale_local {
         spans.push(Span::styled(
             "  ● local stale",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if app.stale_github {
+        spans.push(Span::styled(
+            "  ● GitHub stale",
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -556,13 +688,55 @@ pub fn draw_detail(app: &App, area: Rect, buf: &mut Buffer) {
     Paragraph::new(body).render(inner, buf);
 }
 
+pub fn draw_map_detail(app: &App, area: Rect, buf: &mut Buffer) {
+    let child = match app.current_map_child() {
+        Some(child) => child,
+        None => return,
+    };
+
+    let mut body = format!("State: {}\n", child.state);
+    if !child.issue.assignees.is_empty() {
+        body.push_str(&format!(
+            "Assignees: {}\n",
+            child.issue.assignees.join(", ")
+        ));
+    }
+    if !child.issue.open_blockers.is_empty() {
+        body.push_str(&format!(
+            "Open blockers: {}\n",
+            child
+                .issue
+                .open_blockers
+                .iter()
+                .map(|number| format!("#{number}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    body.push('\n');
+    body.push_str(&render_markdown_to_text(&child.issue.body));
+
+    let block = Block::default()
+        .title(format!(
+            "Issue #{}: {}",
+            child.issue.number, child.issue.title
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    Clear.render(inner, buf);
+    Paragraph::new(body).render(inner, buf);
+}
+
 pub fn draw_help(area: Rect, buf: &mut Buffer) {
     let text = "\
 Copse — terminal board
 
 Views:
   1          Forest (branch → issue → agent)
-  2, m       Map (worktrees + Wayfinder)
+  2, m       Map (Wayfinder frontiers)
+  Tab        Next Wayfinder map
 
 Navigation:
   ↑/↓        Move selection
@@ -587,7 +761,7 @@ Statuses:
 
 Refresh:
   Herdr + local Git/.copse every 2s
-  GitHub + Wayfinder every 30s
+  GitHub Issues + Wayfinder every 30s
   r forces immediate refresh
 
 Press Esc or ? or q to close help.
@@ -662,11 +836,35 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                         }
                     }
                     View::Map => {
-                        MapWidget {
-                            worktrees: &app.board.worktrees,
-                            agents: &app.snapshot.agents,
+                        if app.show_detail {
+                            let cols = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([
+                                    Constraint::Percentage(68),
+                                    Constraint::Percentage(32),
+                                ])
+                                .split(main_area);
+                            let map_area = cols[0];
+                            let detail_area = cols[1];
+                            MapWidget {
+                                maps: &app.map_data,
+                                selected_map: app.selected_map,
+                                selected_child: app
+                                    .current_map_child()
+                                    .map(|_| app.selected_map_child),
+                            }
+                            .render(map_area, f.buffer_mut());
+                            draw_map_detail(&app, detail_area, f.buffer_mut());
+                        } else {
+                            MapWidget {
+                                maps: &app.map_data,
+                                selected_map: app.selected_map,
+                                selected_child: app
+                                    .current_map_child()
+                                    .map(|_| app.selected_map_child),
+                            }
+                            .render(main_area, f.buffer_mut());
                         }
-                        .render(main_area, f.buffer_mut());
                     }
                 }
 
@@ -690,16 +888,17 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                                 // r triggers immediate refresh
                                 if key.code == KeyCode::Char('r') {
                                     app.refresh();
+                                    app.refresh_github();
                                 }
                             }
                             Event::Mouse(me) => {
                                 match me.kind {
                                     MouseEventKind::Down(MouseButton::Left) => {
-                                        // Select node by y position (rough)
-                                        let y = me.row as usize;
-                                        // Forest starts at y=0, so map y to flat index
-                                        if y < app.flat_nodes.len() {
-                                            app.selected = y;
+                                        if app.view == View::Forest {
+                                            let y = me.row as usize;
+                                            if y < app.flat_nodes.len() {
+                                                app.selected = y;
+                                            }
                                         }
                                     }
                                     MouseEventKind::ScrollUp => app.move_up(),
@@ -716,8 +915,7 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                     app.refresh();
                 }
                 _ = github_interval.tick() => {
-                    // GitHub refresh stub: just update timestamp for now.
-                    app.last_github = Instant::now();
+                    app.refresh_github();
                 }
             }
         }
@@ -761,6 +959,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::discovery::Worktree;
+    use crate::github::{FrontierState, GitHubIssue, IssueState, WayfinderChild, WayfinderMap};
     use crate::herdr::{AgentStatus, Snapshot};
     use crate::tracker::{Issue, Link, Status};
     use std::collections::HashMap;
@@ -887,16 +1086,91 @@ mod tests {
         assert!(!app.show_help);
     }
 
+    fn test_map(number: u64, title: &str) -> WayfinderMap {
+        WayfinderMap {
+            issue: GitHubIssue {
+                number,
+                title: title.to_string(),
+                state: IssueState::Closed,
+                body: String::new(),
+                labels: vec!["wayfinder:map".to_string()],
+                assignees: Vec::new(),
+                open_blockers: Vec::new(),
+            },
+            children: vec![
+                WayfinderChild {
+                    issue: GitHubIssue {
+                        number: number + 1,
+                        title: "Done".to_string(),
+                        state: IssueState::Closed,
+                        body: String::new(),
+                        labels: Vec::new(),
+                        assignees: Vec::new(),
+                        open_blockers: Vec::new(),
+                    },
+                    state: FrontierState::Done,
+                },
+                WayfinderChild {
+                    issue: GitHubIssue {
+                        number: number + 2,
+                        title: "Frontier".to_string(),
+                        state: IssueState::Open,
+                        body: String::new(),
+                        labels: Vec::new(),
+                        assignees: Vec::new(),
+                        open_blockers: Vec::new(),
+                    },
+                    state: FrontierState::Frontier,
+                },
+            ],
+            open_child_count: 1,
+        }
+    }
+
+    #[test]
+    fn map_view_selects_frontier_and_cycles_maps() {
+        let board = repo_with_worktrees();
+        let mut app = App::new_for_test(board, Forest::default(), Snapshot::default());
+        app.map_data = vec![test_map(10, "First"), test_map(20, "Second")];
+        app.selected_map = 0;
+        app.selected_map_child = app.first_map_child();
+        app.view = View::Map;
+
+        assert_eq!(app.selected_map_child, 1);
+        app.move_down();
+        assert_eq!(app.selected_map_child, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.selected_map, 1);
+        assert_eq!(app.selected_map_child, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.selected_map, 0);
+    }
+
+    #[test]
+    fn github_refresh_keeps_last_good_data_on_failure() {
+        let board = repo_with_worktrees();
+        let mut app = App::new_for_test(board, Forest::default(), Snapshot::default());
+        app.map_data = vec![test_map(10, "Existing")];
+        app.selected_map = 0;
+        app.cwd = PathBuf::from("/definitely-not-a-copse-repository");
+
+        app.refresh_github();
+
+        assert!(app.stale_github);
+        assert_eq!(app.map_data[0].issue.title, "Existing");
+    }
+
     #[test]
     fn refresh_keeps_last_good_on_failure() {
-        // Just test that refresh doesn't panic when .copse missing and herdr missing
+        // Just test that refresh doesn't panic when .copse is missing and Herdr is missing.
         let board = repo_with_worktrees();
         let forest = Forest::default();
         let snap = Snapshot::default();
         let mut app = App::new_for_test(board, forest, snap);
         // This will try to load from /tmp paths which don't have herdr, but should not panic
         app.refresh();
-        // Should have updated forest (still empty or with available)
+        // Should have updated forest (still empty or with available).
         assert!(app.forest.branches.len() < 1000);
+        assert!(app.stale_local);
     }
 }
