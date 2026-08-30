@@ -71,7 +71,7 @@ pub struct Workspace {
     pub focused: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Snapshot {
     #[serde(default)]
     pub agents: Vec<Agent>,

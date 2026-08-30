@@ -1,4 +1,5 @@
 mod discovery;
+mod forest;
 mod herdr;
 mod tracker;
 
