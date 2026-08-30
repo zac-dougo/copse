@@ -11,7 +11,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use uuid::Uuid;
@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::discovery::{BoardRepository, discover};
 use crate::forest::{Forest, ForestWidget, build_forest, render_markdown_to_text};
 use crate::herdr::{Snapshot, fetch_snapshot_blocking};
+use crate::map::MapWidget;
 use crate::tracker::{load_issues, load_links};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +27,12 @@ pub enum SelectedKind {
     Branch,
     Issue,
     Agent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Forest,
+    Map,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +60,7 @@ pub struct App {
     pub show_help: bool,
     pub show_detail: bool,
     pub status_msg: String,
+    pub view: View,
 }
 
 impl App {
@@ -90,6 +98,7 @@ impl App {
             show_help: false,
             show_detail: false,
             status_msg: String::new(),
+            view: View::Forest,
         };
         app.rebuild_flat();
         Ok(app)
@@ -122,6 +131,7 @@ impl App {
             show_help: false,
             show_detail: false,
             status_msg: String::new(),
+            view: View::Forest,
         };
         app.rebuild_flat();
         app
@@ -368,6 +378,8 @@ impl App {
             KeyCode::Char('?') => {
                 self.show_help = true;
             }
+            KeyCode::Char('1') => self.view = View::Forest,
+            KeyCode::Char('2') | KeyCode::Char('m') => self.view = View::Map,
             KeyCode::Char('q') => return true,
             KeyCode::Esc if self.show_detail => {
                 self.show_detail = false;
@@ -437,9 +449,21 @@ impl App {
 // Rendering helpers
 
 pub fn draw_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
-    let mut spans = vec![Span::raw(
-        " q:quit  r:refresh  ?:help  Enter:details  ↑/↓:navigate  ←/→:collapse/expand",
-    )];
+    let view_label = match app.view {
+        View::Forest => " Forest ",
+        View::Map => " Map ",
+    };
+    let mut spans = vec![
+        Span::styled(
+            view_label.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(
+            " q:quit  r:refresh  ?:help  1:Forest  2:Map  Enter:details  ↑/↓:navigate  ←/→:collapse/expand",
+        ),
+    ];
     if app.stale_herdr {
         spans.push(Span::styled(
             "  ● Herdr stale",
@@ -507,9 +531,8 @@ pub fn draw_detail(app: &App, area: Rect, buf: &mut Buffer) {
                 agent_node.agent.agent, agent_node.agent.pane_id
             );
             let body = format!(
-                "Status: {} {}\nWorkspace: {}\nCWD: {}\nFocused: {}",
-                agent_node.status_symbol,
-                agent_node.agent.agent_status,
+                "Status: {}\nWorkspace: {}\nCWD: {}\nFocused: {}",
+                agent_node.badge,
                 agent_node.agent.workspace_id,
                 agent_node
                     .agent
@@ -537,6 +560,10 @@ pub fn draw_help(area: Rect, buf: &mut Buffer) {
     let text = "\
 Copse — terminal board
 
+Views:
+  1          Forest (branch → issue → agent)
+  2, m       Map (worktrees + Wayfinder)
+
 Navigation:
   ↑/↓        Move selection
   ←          Collapse or move to parent
@@ -553,9 +580,10 @@ Mouse:
 
 Statuses:
   ● working  blue
-  ● idle/done green
-  ● blocked  red
-  ○ unknown  gray
+  ✓ done     green
+  ! blocked  red
+  ○ idle     green
+  · unknown  gray
 
 Refresh:
   Herdr + local Git/.copse every 2s
@@ -607,27 +635,39 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                 let main_area = chunks[0];
                 let status_area = chunks[1];
 
-                if app.show_detail {
-                    let cols = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                        .split(main_area);
-                    let forest_area = cols[0];
-                    let detail_area = cols[1];
-                    ForestWidget {
-                        forest: &app.forest,
-                        selected: Some(app.selected),
+                match app.view {
+                    View::Forest => {
+                        if app.show_detail {
+                            let cols = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([
+                                    Constraint::Percentage(60),
+                                    Constraint::Percentage(40),
+                                ])
+                                .split(main_area);
+                            let forest_area = cols[0];
+                            let detail_area = cols[1];
+                            ForestWidget {
+                                forest: &app.forest,
+                                selected: Some(app.selected),
+                            }
+                            .render(forest_area, f.buffer_mut());
+                            draw_detail(&app, detail_area, f.buffer_mut());
+                        } else {
+                            ForestWidget {
+                                forest: &app.forest,
+                                selected: Some(app.selected),
+                            }
+                            .render(main_area, f.buffer_mut());
+                        }
                     }
-                    .render(forest_area, f.buffer_mut());
-                    // Highlight selection
-                    // For simplicity, we don't draw a separate highlight; ForestWidget could.
-                    draw_detail(&app, detail_area, f.buffer_mut());
-                } else {
-                    ForestWidget {
-                        forest: &app.forest,
-                        selected: Some(app.selected),
+                    View::Map => {
+                        MapWidget {
+                            worktrees: &app.board.worktrees,
+                            agents: &app.snapshot.agents,
+                        }
+                        .render(main_area, f.buffer_mut());
                     }
-                    .render(main_area, f.buffer_mut());
                 }
 
                 draw_status_bar(&app, status_area, f.buffer_mut());

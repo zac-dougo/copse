@@ -2,6 +2,7 @@ mod app;
 mod discovery;
 mod forest;
 mod herdr;
+mod map;
 mod tracker;
 
 use clap::Parser;

@@ -12,13 +12,13 @@ use uuid::Uuid;
 
 use crate::discovery::Worktree;
 use crate::herdr::{Agent, AgentStatus, Snapshot};
-use crate::tracker::{Issue, Status as IssueStatus};
+use crate::tracker::Issue;
 
 #[derive(Debug, Clone)]
 pub struct AgentNode {
     pub agent: Agent,
-    pub status_symbol: String,
-    pub status_color: Color,
+    pub badge: String,
+    pub color: Color,
 }
 
 #[derive(Debug, Clone)]
@@ -47,12 +47,13 @@ impl Forest {
     }
 }
 
-pub fn status_style_and_symbol(status: AgentStatus) -> (Color, &'static str) {
+pub fn status_badge(status: AgentStatus) -> (Color, &'static str) {
     match status {
-        AgentStatus::Working => (Color::Blue, "●"),
-        AgentStatus::Idle | AgentStatus::Done => (Color::Green, "●"),
-        AgentStatus::Blocked => (Color::Red, "●"),
-        AgentStatus::Unknown => (Color::Gray, "○"),
+        AgentStatus::Working => (Color::Blue, "● working"),
+        AgentStatus::Done => (Color::Green, "✓ done"),
+        AgentStatus::Blocked => (Color::Red, "! blocked"),
+        AgentStatus::Idle => (Color::Green, "○ idle"),
+        AgentStatus::Unknown => (Color::Gray, "· unknown"),
     }
 }
 
@@ -82,7 +83,6 @@ pub fn build_forest(
         issue_by_id.insert(issue.id, issue.clone());
     }
 
-    // Map worktree path -> issue id via Links (1:1, last wins on duplicate)
     let mut wt_to_issue: HashMap<PathBuf, Uuid> = HashMap::new();
     let mut issue_to_wt: HashMap<Uuid, PathBuf> = HashMap::new();
     for link in &links {
@@ -91,14 +91,12 @@ pub fn build_forest(
         issue_to_wt.insert(link.issue, wt_path);
     }
 
-    // Map agents to worktrees by prefix matching
     let wt_paths: Vec<PathBuf> = worktrees.iter().map(|w| w.path.clone()).collect();
     let mut agents_by_wt: HashMap<PathBuf, Vec<Agent>> = HashMap::new();
     for agent in &snapshot.agents {
         let cwd_str = agent.foreground_cwd.as_ref().or(agent.cwd.as_ref());
         if let Some(cwd_str) = cwd_str {
             let cwd = PathBuf::from(cwd_str);
-            // Find longest matching worktree
             let mut best: Option<PathBuf> = None;
             let mut best_len = 0;
             for wt_path in &wt_paths {
@@ -116,7 +114,6 @@ pub fn build_forest(
         }
     }
 
-    // Build branches sorted: main first, then alphabetical by branch name or path
     let mut sorted_wts = worktrees.clone();
     sorted_wts.sort_by(|a, b| {
         let a_main = branch_is_main(&a.branch);
@@ -157,11 +154,11 @@ pub fn build_forest(
                     .unwrap_or_default()
                     .into_iter()
                     .map(|agent| {
-                        let (color, symbol) = status_style_and_symbol(agent.agent_status);
+                        let (color, badge) = status_badge(agent.agent_status);
                         AgentNode {
                             agent,
-                            status_color: color,
-                            status_symbol: symbol.to_string(),
+                            badge: badge.to_string(),
+                            color,
                         }
                     })
                     .collect();
@@ -173,11 +170,6 @@ pub fn build_forest(
                 None
             }
         } else {
-            // No linked issue, but still show agents under issue-less branch?
-            // For forest spec, agents are children of issues, so we only show agents if there's an issue.
-            // However, if there are agents but no issue, we could create a synthetic issue node?
-            // For v1, we keep agents only if there's a linked issue; otherwise agents are not shown in tree.
-            // This matches branch → issue → agent strictly.
             None
         };
 
@@ -189,7 +181,6 @@ pub fn build_forest(
         });
     }
 
-    // Unlinked issues: those not in any link
     let mut unlinked_issues = Vec::new();
     for issue in issues {
         if !linked_issue_ids.contains(&issue.id) {
@@ -200,131 +191,171 @@ pub fn build_forest(
         }
     }
 
-    // If there are agents that mapped to a worktree but that worktree had no linked issue,
-    // those agents are currently not shown. For v1, we keep that behavior (strict tree).
-    // Future could show them under a placeholder.
-
     Forest {
         branches,
         unlinked_issues,
     }
 }
 
-// Rendering
-
 pub struct ForestWidget<'a> {
     pub forest: &'a Forest,
-    pub selected: Option<usize>, // flat index for highlight, not used yet
+    pub selected: Option<usize>,
 }
 
 impl<'a> Widget for ForestWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
         let mut y = area.y;
         let max_y = area.y + area.height;
+        let max_x = area.x + area.width;
 
-        for branch in &self.forest.branches {
+        // Header: repository
+        if y < max_y {
+            let line = Line::from(vec![Span::styled(
+                "repository",
+                Style::default().add_modifier(Modifier::BOLD),
+            )]);
+            buf.set_line(area.x + 2, y, &line, area.width.saturating_sub(2));
+            y += 1;
+        }
+        // Blank line after header
+        if y < max_y {
+            y += 1;
+        }
+
+        for (idx, branch) in self.forest.branches.iter().enumerate() {
             if y >= max_y {
                 break;
             }
-            // Branch line: branch name, bold if main
+            let is_last =
+                idx == self.forest.branches.len() - 1 && self.forest.unlinked_issues.is_empty();
+            let joint = if is_last { "└─" } else { "├─" };
             let branch_style = if branch.is_main {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
                 Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
             };
             let branch_line = Line::from(vec![
-                Span::styled("▶ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(joint.to_string(), Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
                 Span::styled(branch.branch_name.clone(), branch_style),
-                Span::styled(
-                    format!("  {}", branch.worktree.path.display()),
-                    Style::default().fg(Color::DarkGray),
-                ),
             ]);
-            buf.set_line(area.x, y, &branch_line, area.width);
+            buf.set_line(area.x + 2, y, &branch_line, area.width.saturating_sub(2));
             y += 1;
             if y >= max_y {
                 break;
             }
 
-            if let Some(issue) = &branch.issue {
-                // Issue line: indent 2
-                let issue_status_str = match issue.issue.status {
-                    IssueStatus::Open => "open",
-                    IssueStatus::Closed => "closed",
-                    IssueStatus::Archived => "archived",
-                };
-                let issue_line = Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("○ ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(issue.issue.title.clone()),
-                    Span::styled(
-                        format!(" [{}]", issue_status_str),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]);
-                buf.set_line(area.x, y, &issue_line, area.width);
-                y += 1;
-                if y >= max_y {
-                    break;
-                }
+            // Issue line
+            let issue_line = if let Some(issue_node) = &branch.issue {
+                Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled("issue  ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(issue_node.issue.title.clone()),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled("issue  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("No linked issue", Style::default().fg(Color::DarkGray)),
+                ])
+            };
+            buf.set_line(area.x, y, &issue_line, area.width);
+            y += 1;
+            if y >= max_y {
+                break;
+            }
 
-                for agent_node in &issue.agents {
-                    if y >= max_y {
-                        break;
-                    }
-                    let (color, symbol) = status_style_and_symbol(agent_node.agent.agent_status);
-                    let status_str = agent_node.agent.agent_status.to_string();
-                    let agent_line = Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(format!("{} ", symbol), Style::default().fg(color)),
-                        Span::raw(agent_node.agent.agent.clone()),
-                        Span::styled(format!(" [{}]", status_str), Style::default().fg(color)),
-                        Span::styled(
-                            format!(" {}", agent_node.agent.pane_id),
-                            Style::default().fg(Color::DarkGray),
-                        ),
+            // Agent line(s) — for prototype, one line per worktree; if multiple agents, show each
+            if let Some(issue_node) = &branch.issue {
+                if issue_node.agents.is_empty() {
+                    // No agent linked to this issue's worktree
+                    let line = Line::from(vec![
+                        Span::raw("      "),
+                        Span::styled("agent  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("—  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("· no agent", Style::default().fg(Color::DarkGray)),
                     ]);
-                    buf.set_line(area.x, y, &agent_line, area.width);
+                    buf.set_line(area.x, y, &line, area.width);
                     y += 1;
+                } else {
+                    for agent_node in &issue_node.agents {
+                        if y >= max_y {
+                            break;
+                        }
+                        let line = Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled("agent  ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(format!("{}  ", agent_node.agent.agent)),
+                            Span::styled(
+                                agent_node.badge.clone(),
+                                Style::default().fg(agent_node.color),
+                            ),
+                        ]);
+                        buf.set_line(area.x, y, &line, area.width);
+                        y += 1;
+                    }
                 }
+            } else {
+                // No issue, show no agent as well
+                let line = Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled("agent  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("—  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("· no agent", Style::default().fg(Color::DarkGray)),
+                ]);
+                buf.set_line(area.x, y, &line, area.width);
+                y += 1;
+            }
+
+            // Blank row between worktrees (spaced look)
+            if y < max_y {
+                y += 1;
             }
         }
 
         // Unlinked issues section
-        if !self.forest.unlinked_issues.is_empty() && y < max_y {
+        if !self.forest.unlinked_issues.is_empty() && y + 1 < max_y {
             let header = Line::from(vec![Span::styled(
                 "─ unlinked ─",
                 Style::default().fg(Color::DarkGray),
             )]);
-            buf.set_line(area.x, y, &header, area.width);
+            buf.set_line(area.x + 2, y, &header, area.width.saturating_sub(2));
             y += 1;
             for issue_node in &self.forest.unlinked_issues {
                 if y >= max_y {
                     break;
                 }
-                let issue_status_str = match issue_node.issue.status {
-                    IssueStatus::Open => "open",
-                    IssueStatus::Closed => "closed",
-                    IssueStatus::Archived => "archived",
-                };
                 let line = Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("○ ", Style::default().fg(Color::DarkGray)),
+                    Span::raw("      "),
+                    Span::styled("issue  ", Style::default().fg(Color::DarkGray)),
                     Span::raw(issue_node.issue.title.clone()),
-                    Span::styled(
-                        format!(" [{}]", issue_status_str),
-                        Style::default().fg(Color::DarkGray),
-                    ),
                 ]);
                 buf.set_line(area.x, y, &line, area.width);
                 y += 1;
             }
         }
+
+        // Footer hint
+        if y + 1 < max_y {
+            y += 1;
+            let footer = Line::from(vec![Span::styled(
+                "Read this as: branch → issue → agent. Empty links are visible gaps.",
+                Style::default().fg(Color::DarkGray),
+            )]);
+            buf.set_line(area.x + 2, y, &footer, area.width.saturating_sub(2));
+        }
+
+        // Selection highlight: dim overlay for selected row is handled by App's flat index,
+        // but we keep forest widget simple. The App will draw highlight via style if needed.
+        let _ = max_x;
     }
 }
 
-// Helper to render issue body markdown as plain text for detail pane.
-// For v1, we just strip markdown to text via pulldown-cmark.
 pub fn render_markdown_to_text(md: &str) -> String {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
     let parser = Parser::new(md);
@@ -492,23 +523,26 @@ mod tests {
         let agents = &forest.branches[0].issue.as_ref().unwrap().agents;
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].agent.pane_id, "w1:p1");
-        assert_eq!(agents[0].status_color, Color::Blue);
+        assert_eq!(agents[0].color, Color::Blue);
     }
 
     #[test]
-    fn agent_status_colors() {
-        let (c, s) = status_style_and_symbol(AgentStatus::Working);
+    fn agent_status_badge() {
+        let (c, s) = status_badge(AgentStatus::Working);
         assert_eq!(c, Color::Blue);
-        assert_eq!(s, "●");
-        let (c, _) = status_style_and_symbol(AgentStatus::Idle);
+        assert_eq!(s, "● working");
+        let (c, s) = status_badge(AgentStatus::Idle);
         assert_eq!(c, Color::Green);
-        let (c, _) = status_style_and_symbol(AgentStatus::Done);
+        assert_eq!(s, "○ idle");
+        let (c, s) = status_badge(AgentStatus::Done);
         assert_eq!(c, Color::Green);
-        let (c, _) = status_style_and_symbol(AgentStatus::Blocked);
+        assert_eq!(s, "✓ done");
+        let (c, s) = status_badge(AgentStatus::Blocked);
         assert_eq!(c, Color::Red);
-        let (c, sym) = status_style_and_symbol(AgentStatus::Unknown);
+        assert_eq!(s, "! blocked");
+        let (c, s) = status_badge(AgentStatus::Unknown);
         assert_eq!(c, Color::Gray);
-        assert_eq!(sym, "○");
+        assert_eq!(s, "· unknown");
     }
 
     #[test]
@@ -528,7 +562,7 @@ mod tests {
         snap.agents = vec![test_agent("w5:p1", AgentStatus::Working, "/tmp/repo")];
         let forest = build_forest(vec![wt], vec![issue], vec![link], &snap);
 
-        let area = Rect::new(0, 0, 80, 10);
+        let area = Rect::new(0, 0, 80, 20);
         let mut buf = Buffer::empty(area);
         ForestWidget {
             forest: &forest,
@@ -536,7 +570,6 @@ mod tests {
         }
         .render(area, &mut buf);
 
-        // Convert buffer to string for inspection
         let content: String = (0..area.height)
             .map(|y| {
                 let line: String = (0..area.width)
@@ -547,10 +580,24 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
+        assert!(content.contains("repository"), "header missing: {content}");
         assert!(content.contains("main"), "branch not rendered: {content}");
-        assert!(content.contains("My Issue"), "issue not rendered");
-        assert!(content.contains("w5:p1"), "agent pane not rendered");
-        assert!(content.contains("working"), "status not rendered");
+        assert!(
+            content.contains("issue  My Issue"),
+            "issue not rendered: {content}"
+        );
+        assert!(
+            content.contains("agent  pi"),
+            "agent not rendered: {content}"
+        );
+        assert!(
+            content.contains("● working"),
+            "badge not rendered: {content}"
+        );
+        assert!(
+            content.contains("Read this as: branch → issue → agent"),
+            "footer missing: {content}"
+        );
     }
 
     #[test]
