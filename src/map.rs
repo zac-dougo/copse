@@ -277,6 +277,7 @@ mod tests {
                     IssueState::Open
                 },
                 body: String::new(),
+                comments: Vec::new(),
                 labels: Vec::new(),
                 assignees: Vec::new(),
                 open_blockers: if state == FrontierState::Blocked {
@@ -296,6 +297,7 @@ mod tests {
                 title: "Copse map".to_string(),
                 state: IssueState::Open,
                 body: String::new(),
+                comments: Vec::new(),
                 labels: vec!["wayfinder:map".to_string()],
                 assignees: Vec::new(),
                 open_blockers: Vec::new(),

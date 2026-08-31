@@ -38,6 +38,7 @@ Keys:
 - `↑` / `↓` move selection
 - `←` / `→` collapse, expand, or move to parent/child in Forest
 - `Enter` toggle the selected Issue's detail pane
+- `PgUp` / `PgDn` scroll Map Issue details
 - `r` refresh all sources now
 - `?` toggle help
 - `Esc` close detail or help
@@ -101,7 +102,7 @@ Forest layout is branch → Issue → Agent. The main branch is bold. Agent stat
 
 Map layout is a selected Wayfinder map grouped into Frontier, Blocked, Assigned, and Done sections. Frontier means an open Issue with no open blocker and no assignee. The Map view shows Wayfinder Issues only. It does not add Worktree or Agent context. The map with the most open children is selected first; `Tab` cycles through other maps. Copse reads maps with `gh issue list`; if GitHub is unavailable, the last good map remains visible and the status bar marks it stale.
 
-Both views can open a detail pane for the selected Issue.
+Both views can open a detail pane for the selected Issue. Map details wrap the Issue body, include GitHub comments, and support `PgUp` / `PgDn` scrolling.
 
 ## Refresh
 

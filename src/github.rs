@@ -7,7 +7,8 @@ use std::process::Command;
 use serde::Deserialize;
 use thiserror::Error;
 
-const ISSUE_FIELDS: &str = "number,title,state,body,labels,assignees,blockedBy,parent,subIssues";
+const ISSUE_FIELDS: &str =
+    "number,title,state,body,labels,assignees,comments,blockedBy,parent,subIssues";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueState {
@@ -35,11 +36,18 @@ impl std::fmt::Display for IssueState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubComment {
+    pub author: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitHubIssue {
     pub number: u64,
     pub title: String,
     pub state: IssueState,
     pub body: String,
+    pub comments: Vec<GitHubComment>,
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
     pub open_blockers: Vec<u64>,
@@ -104,6 +112,8 @@ struct RawIssue {
     labels: Vec<RawLabel>,
     #[serde(default)]
     assignees: Vec<RawAssignee>,
+    #[serde(default)]
+    comments: Vec<RawComment>,
     #[serde(default, rename = "blockedBy")]
     blocked_by: Option<RawConnection>,
     #[serde(default)]
@@ -120,6 +130,14 @@ struct RawLabel {
 #[derive(Debug, Deserialize)]
 struct RawAssignee {
     login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawComment {
+    #[serde(default)]
+    author: Option<RawAssignee>,
+    #[serde(default)]
+    body: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,6 +289,17 @@ impl TryFrom<RawIssue> for IssueRecord {
             .into_iter()
             .map(|assignee| assignee.login)
             .collect();
+        let comments = raw
+            .comments
+            .into_iter()
+            .map(|comment| GitHubComment {
+                author: comment
+                    .author
+                    .map(|author| author.login)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                body: comment.body.unwrap_or_default(),
+            })
+            .collect();
         let native_blockers = raw
             .blocked_by
             .unwrap_or(RawConnection { nodes: Vec::new() })
@@ -296,6 +325,7 @@ impl TryFrom<RawIssue> for IssueRecord {
                 title: raw.title,
                 state,
                 body: raw.body.unwrap_or_default(),
+                comments,
                 labels,
                 assignees,
                 open_blockers: Vec::new(),
@@ -447,6 +477,7 @@ mod tests {
             title: title.to_string(),
             state,
             body: String::new(),
+            comments: Vec::new(),
             labels: Vec::new(),
             assignees: assignees.iter().map(|name| (*name).to_string()).collect(),
             open_blockers: open_blockers.to_vec(),
@@ -535,6 +566,48 @@ mod tests {
         );
         assert_eq!(maps[0].children[0].state, FrontierState::Done);
         assert_eq!(maps[0].children[1].state, FrontierState::Frontier);
+    }
+
+    #[test]
+    fn keeps_wayfinder_comments_with_the_issue() {
+        let json = r###"
+        [
+          {
+            "number": 1,
+            "title": "Map",
+            "state": "OPEN",
+            "body": "- [ ] #2",
+            "labels": [{"name":"wayfinder:map"}],
+            "assignees": [],
+            "comments": [],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          },
+          {
+            "number": 2,
+            "title": "Question",
+            "state": "CLOSED",
+            "body": "## Question\n\nWhat should we do?\n",
+            "labels": [],
+            "assignees": [],
+            "comments": [{
+              "author": {"login":"zacd1302-ops"},
+              "body": "## Answer\n\nUse the Forest layout."
+            }],
+            "blockedBy": {"nodes":[],"totalCount":0},
+            "parent": null,
+            "subIssues": {"nodes":[],"totalCount":0}
+          }
+        ]
+        "###;
+
+        let maps = parse_wayfinder_maps(json).unwrap();
+        assert_eq!(maps[0].children[0].issue.comments.len(), 1);
+        assert_eq!(
+            maps[0].children[0].issue.comments[0].body,
+            "## Answer\n\nUse the Forest layout."
+        );
     }
 
     #[test]

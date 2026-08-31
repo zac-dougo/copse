@@ -13,7 +13,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use uuid::Uuid;
 
 use crate::discovery::{BoardRepository, discover};
@@ -65,6 +65,7 @@ pub struct App {
     pub map_data: MapData,
     pub selected_map: usize,
     pub selected_map_child: usize,
+    pub map_detail_scroll: u16,
     pub stale_github: bool,
 }
 
@@ -112,6 +113,7 @@ impl App {
             map_data,
             selected_map,
             selected_map_child: 0,
+            map_detail_scroll: 0,
             stale_github,
         };
         app.selected_map_child = app.first_map_child();
@@ -150,6 +152,7 @@ impl App {
             map_data: MapData::new(),
             selected_map: 0,
             selected_map_child: 0,
+            map_detail_scroll: 0,
             stale_github: false,
         };
         app.selected_map_child = app.first_map_child();
@@ -219,6 +222,7 @@ impl App {
                 && position > 0
             {
                 self.selected_map_child = order[position - 1];
+                self.map_detail_scroll = 0;
             }
             return;
         }
@@ -236,6 +240,7 @@ impl App {
                 && position + 1 < order.len()
             {
                 self.selected_map_child = order[position + 1];
+                self.map_detail_scroll = 0;
             }
             return;
         }
@@ -275,6 +280,7 @@ impl App {
         }
         self.selected_map = (self.selected_map + 1) % self.map_data.len();
         self.selected_map_child = self.first_map_child();
+        self.map_detail_scroll = 0;
     }
 
     fn current_map_child(&self) -> Option<&crate::github::WayfinderChild> {
@@ -300,6 +306,7 @@ impl App {
                 })
             })
             .unwrap_or_else(|| self.first_map_child());
+        self.map_detail_scroll = 0;
     }
 
     pub fn toggle_expand(&mut self) {
@@ -372,6 +379,27 @@ impl App {
         }
         if self.view == View::Map && matches!(key.code, KeyCode::Left | KeyCode::Right) {
             return false;
+        }
+        if self.show_detail && self.view == View::Map {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.map_detail_scroll = self.map_detail_scroll.saturating_sub(5);
+                    return false;
+                }
+                KeyCode::PageDown => {
+                    self.map_detail_scroll = self.map_detail_scroll.saturating_add(5);
+                    return false;
+                }
+                KeyCode::Home => {
+                    self.map_detail_scroll = 0;
+                    return false;
+                }
+                KeyCode::End => {
+                    self.map_detail_scroll = u16::MAX;
+                    return false;
+                }
+                _ => {}
+            }
         }
 
         match key.code {
@@ -474,6 +502,7 @@ impl App {
             KeyCode::Enter => {
                 if self.view == View::Forest || self.current_map_child().is_some() {
                     self.show_detail = !self.show_detail;
+                    self.map_detail_scroll = 0;
                 }
             }
             KeyCode::Char('r') => {
@@ -486,10 +515,12 @@ impl App {
             KeyCode::Char('1') => {
                 self.view = View::Forest;
                 self.show_detail = false;
+                self.map_detail_scroll = 0;
             }
             KeyCode::Char('2') | KeyCode::Char('m') => {
                 self.view = View::Map;
                 self.show_detail = false;
+                self.map_detail_scroll = 0;
             }
             KeyCode::Tab if self.view == View::Map => self.next_map(),
             KeyCode::Char('q') => return true,
@@ -715,6 +746,10 @@ pub fn draw_map_detail(app: &App, area: Rect, buf: &mut Buffer) {
     }
     body.push('\n');
     body.push_str(&render_markdown_to_text(&child.issue.body));
+    for comment in &child.issue.comments {
+        body.push_str(&format!("\n\nComment by {}:\n", comment.author));
+        body.push_str(&render_markdown_to_text(&comment.body));
+    }
 
     let block = Block::default()
         .title(format!(
@@ -726,7 +761,25 @@ pub fn draw_map_detail(app: &App, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
     Clear.render(inner, buf);
-    Paragraph::new(body).render(inner, buf);
+    let max_scroll = wrapped_line_count(&body, inner.width)
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .scroll((app.map_detail_scroll.min(max_scroll), 0))
+        .render(inner, buf);
+}
+
+fn wrapped_line_count(text: &str, width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    text.split('\n')
+        .map(|line| {
+            let line_width = Line::from(line).width();
+            line_width.max(1).div_ceil(width as usize)
+        })
+        .sum()
 }
 
 pub fn draw_help(area: Rect, buf: &mut Buffer) {
@@ -743,6 +796,7 @@ Navigation:
   ←          Collapse or move to parent
   →          Expand or move to child
   Enter      Toggle detail pane
+  PgUp/PgDn  Scroll Map Issue detail
   r          Refresh all sources now
   ?          Toggle this help
   q, Ctrl-C  Quit
@@ -959,7 +1013,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::discovery::Worktree;
-    use crate::github::{FrontierState, GitHubIssue, IssueState, WayfinderChild, WayfinderMap};
+    use crate::github::{
+        FrontierState, GitHubComment, GitHubIssue, IssueState, WayfinderChild, WayfinderMap,
+    };
     use crate::herdr::{AgentStatus, Snapshot};
     use crate::tracker::{Issue, Link, Status};
     use std::collections::HashMap;
@@ -1093,6 +1149,7 @@ mod tests {
                 title: title.to_string(),
                 state: IssueState::Closed,
                 body: String::new(),
+                comments: Vec::new(),
                 labels: vec!["wayfinder:map".to_string()],
                 assignees: Vec::new(),
                 open_blockers: Vec::new(),
@@ -1104,6 +1161,7 @@ mod tests {
                         title: "Done".to_string(),
                         state: IssueState::Closed,
                         body: String::new(),
+                        comments: Vec::new(),
                         labels: Vec::new(),
                         assignees: Vec::new(),
                         open_blockers: Vec::new(),
@@ -1116,6 +1174,7 @@ mod tests {
                         title: "Frontier".to_string(),
                         state: IssueState::Open,
                         body: String::new(),
+                        comments: Vec::new(),
                         labels: Vec::new(),
                         assignees: Vec::new(),
                         open_blockers: Vec::new(),
@@ -1144,6 +1203,55 @@ mod tests {
         assert_eq!(app.selected_map_child, 1);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.selected_map, 0);
+    }
+
+    #[test]
+    fn map_detail_wraps_body_and_includes_comments() {
+        let board = repo_with_worktrees();
+        let mut map = test_map(10, "Map");
+        map.children[0].issue.body = "## Question\n\nThis is a long question with a wrap-marker that should continue on another line in the detail pane.\n".to_string();
+        map.children[0].issue.comments = vec![GitHubComment {
+            author: "zac".to_string(),
+            body: "## Answer\n\nThis is the actual answer content.".to_string(),
+        }];
+        let mut app = App::new_for_test(board, Forest::default(), Snapshot::default());
+        app.map_data = vec![map];
+        app.selected_map = 0;
+        app.selected_map_child = 0;
+
+        let area = Rect::new(0, 0, 32, 24);
+        let mut buf = Buffer::empty(area);
+        draw_map_detail(&app, area, &mut buf);
+        let rendered: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("wrap-marker"));
+        assert!(rendered.contains("actual answer"));
+        assert!(rendered.contains("content."));
+    }
+
+    #[test]
+    fn map_detail_scroll_keys_move_through_issue_content() {
+        let board = repo_with_worktrees();
+        let mut app = App::new_for_test(board, Forest::default(), Snapshot::default());
+        app.map_data = vec![test_map(10, "Map")];
+        app.view = View::Map;
+        app.show_detail = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.map_detail_scroll, 5);
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.map_detail_scroll, 0);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.map_detail_scroll, u16::MAX);
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.map_detail_scroll, 0);
     }
 
     #[test]
