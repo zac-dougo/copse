@@ -36,6 +36,11 @@ impl<'a> Widget for MapWidget<'a> {
         );
         y += 1;
 
+        if !self.maps.is_empty() && y < footer_y {
+            render_map_tabs(self.maps, self.selected_map, area, y, buf);
+            y += 1;
+        }
+
         if let Some(map) = self.maps.get(self.selected_map) {
             y = render_map_header(map, area, y, footer_y, buf);
             render_sections(map, area, y, footer_y, self.selected_child, buf);
@@ -70,7 +75,7 @@ impl<'a> Widget for MapWidget<'a> {
 fn render_map_header(
     map: &WayfinderMap,
     area: Rect,
-    mut y: u16,
+    y: u16,
     footer_y: u16,
     buf: &mut Buffer,
 ) -> u16 {
@@ -94,21 +99,38 @@ fn render_map_header(
             Style::default().add_modifier(Modifier::BOLD),
         )),
     );
-    y += 1;
-    if y < footer_y {
-        write_line(
-            buf,
-            area.x + 2,
-            y,
-            area.width.saturating_sub(2),
-            Line::from(Span::styled(
-                "Tab: next map",
-                Style::default().fg(Color::DarkGray),
-            )),
-        );
-        y += 1;
+    y + 1
+}
+
+fn render_map_tabs(maps: &MapData, selected_map: usize, area: Rect, y: u16, buf: &mut Buffer) {
+    let mut spans = vec![Span::styled(
+        "Maps ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    for (index, map) in maps.iter().enumerate() {
+        let style = if index == selected_map {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(
+            format!("[#{} {}]", map.issue.number, map.issue.title),
+            style,
+        ));
+        if index + 1 < maps.len() {
+            spans.push(Span::raw(" "));
+        }
     }
-    y
+    write_line(
+        buf,
+        area.x + 2,
+        y,
+        area.width.saturating_sub(2),
+        Line::from(spans),
+    );
 }
 
 fn render_sections(
@@ -321,6 +343,26 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn renders_map_selector_bar() {
+        let mut second = map();
+        second.issue.number = 20;
+        second.issue.title = "Second map".to_string();
+        let maps = vec![map(), second];
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        MapWidget {
+            maps: &maps,
+            selected_map: 1,
+            selected_child: None,
+        }
+        .render(area, &mut buf);
+
+        let rendered = content(&buf, area);
+        assert!(rendered.contains("Maps [#10 Copse map] [#20 Second map]"));
+        assert!((0..area.width).any(|x| buf[(x, 1)].bg == Color::Cyan));
     }
 
     #[test]
