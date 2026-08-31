@@ -76,8 +76,8 @@ impl App {
         let links = load_links(&board.links_dir).unwrap_or_default();
         let snapshot = fetch_snapshot_blocking().unwrap_or_default();
         let forest = build_forest(board.worktrees.clone(), issues, links, &snapshot);
-        let (map_data, stale_github) = match fetch_wayfinder_maps(&cwd) {
-            Ok(maps) => (maps, false),
+        let (map_data, stale_github) = match fetch_wayfinder_maps(&cwd, &board.issues_dir) {
+            Ok(result) => result,
             Err(_) => (MapData::new(), true),
         };
         let selected_map = default_map_index(&map_data).unwrap_or(0);
@@ -583,10 +583,10 @@ impl App {
 
     pub fn refresh_github(&mut self) {
         self.last_github = Instant::now();
-        match fetch_wayfinder_maps(&self.cwd) {
-            Ok(map_data) => {
+        match fetch_wayfinder_maps(&self.cwd, &self.board.issues_dir) {
+            Ok((map_data, stale_github)) => {
                 self.replace_map_data(map_data);
-                self.stale_github = false;
+                self.stale_github = stale_github;
             }
             Err(_) => {
                 self.stale_github = true;

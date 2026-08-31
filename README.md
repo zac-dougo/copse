@@ -100,7 +100,7 @@ Forest layout is branch → Issue → Agent. The main branch is bold. Agent stat
 - blocked red `!`
 - unknown gray `·`
 
-Map layout is a selected Wayfinder map grouped into Frontier, Blocked, Assigned, and Done sections. Frontier means an open Issue with no open blocker and no assignee. The Map view shows Wayfinder Issues only. It does not add Worktree or Agent context. The map with the most open children is selected first; `Tab` cycles through other maps. Copse reads maps with `gh issue list`; if GitHub is unavailable, the last good map remains visible and the status bar marks it stale.
+Map layout is a selected Wayfinder map grouped into Frontier, Blocked, Assigned, and Done sections. Frontier means an open Issue with no open blocker and no assignee. The Map view shows Wayfinder Issues only. It does not add Worktree or Agent context. The map with the most open children is selected first; `Tab` cycles through other maps. Copse reads GitHub maps with `gh issue list` and local maps from `.copse/issues`. Local map children use `Parent: <uuid>` and `Blocked by: <uuid>, <uuid>` body lines. If GitHub is unavailable, local maps still load and the status bar marks GitHub stale.
 
 Both views can open a detail pane for the selected Issue. Map details wrap the Issue body, include GitHub comments, and support `PgUp` / `PgDn` scrolling.
 
@@ -108,7 +108,7 @@ Both views can open a detail pane for the selected Issue. Map details wrap the I
 
 - Load all data on startup.
 - Poll Herdr and local Git/`.copse` every 2 seconds.
-- Poll GitHub Issues and Wayfinder every 30 seconds.
+- Poll GitHub Issues and Wayfinder every 30 seconds. Local maps refresh with the local tracker poll.
 - `r` forces an immediate refresh.
 - Keep the last good data when a source fails and show a stale indicator. If Herdr is unavailable, the board shows without live agent state.
 
@@ -131,7 +131,7 @@ Tests cover tracker parsing, repository discovery, Herdr snapshot parsing, fores
 - Missing `.copse` starts without issues and does not create files until the first write.
 - Outside a Git worktree prints an error and exits.
 - Forest shows branches, linked Issues, and Agents with correct statuses and colors.
-- Map shows Wayfinder Issues grouped by frontier state and keeps map order within each section.
+- Map shows GitHub and local Wayfinder Issues grouped by frontier state and keeps map order within each section.
 - Keys and mouse work as listed, and refresh intervals behave as above.
 
 ## Stack

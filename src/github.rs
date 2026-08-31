@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
+use crate::tracker::{Issue, Status, load_issues};
+
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -99,6 +101,8 @@ pub enum GitHubError {
     InvalidState(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("local tracker error: {0}")]
+    Local(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,7 +205,25 @@ pub fn map_index_for_number(maps: &[WayfinderMap], selected_number: Option<u64>)
         .or_else(|| default_map_index(maps))
 }
 
-pub fn fetch_wayfinder_maps(cwd: &Path) -> Result<MapData, GitHubError> {
+pub fn fetch_wayfinder_maps(
+    cwd: &Path,
+    local_issues_dir: &Path,
+) -> Result<(MapData, bool), GitHubError> {
+    let local_maps = fetch_local_wayfinder_maps(local_issues_dir).unwrap_or_default();
+
+    let github_maps = fetch_github_wayfinder_maps(cwd);
+    match github_maps {
+        Ok(mut maps) => {
+            let mut combined = local_maps;
+            combined.append(&mut maps);
+            Ok((combined, false))
+        }
+        Err(_error) if !local_maps.is_empty() => Ok((local_maps, true)),
+        Err(error) => Err(error),
+    }
+}
+
+fn fetch_github_wayfinder_maps(cwd: &Path) -> Result<MapData, GitHubError> {
     let output = Command::new("gh")
         .current_dir(cwd)
         .args([
@@ -230,6 +252,133 @@ pub fn fetch_wayfinder_maps(cwd: &Path) -> Result<MapData, GitHubError> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_wayfinder_maps(&stdout)
+}
+
+pub fn fetch_local_wayfinder_maps(issues_dir: &Path) -> Result<MapData, GitHubError> {
+    let mut issues =
+        load_issues(issues_dir).map_err(|error| GitHubError::Local(error.to_string()))?;
+    issues.sort_by_key(|issue| issue.id);
+
+    let numbers = issues
+        .iter()
+        .enumerate()
+        .map(|(index, issue)| (issue.id, index as u64 + 1))
+        .collect::<HashMap<_, _>>();
+    let by_id = issues
+        .iter()
+        .map(|issue| (issue.id, issue))
+        .collect::<HashMap<_, _>>();
+
+    let mut maps = issues
+        .iter()
+        .filter(|issue| {
+            issue_labels(issue)
+                .iter()
+                .any(|label| label == "wayfinder:map")
+        })
+        .map(|map| {
+            let children = issues
+                .iter()
+                .filter(|issue| parse_parent_id(&issue.body) == Some(map.id))
+                .map(|child| local_child(child, &numbers, &by_id))
+                .collect::<Vec<_>>();
+            WayfinderMap {
+                issue: local_issue(map, numbers[&map.id], Vec::new()),
+                open_child_count: children
+                    .iter()
+                    .filter(|child| child.issue.state == IssueState::Open)
+                    .count(),
+                children,
+            }
+        })
+        .collect::<Vec<_>>();
+    maps.sort_by_key(|map| map.issue.number);
+    Ok(maps)
+}
+
+fn local_child(
+    issue: &Issue,
+    numbers: &HashMap<uuid::Uuid, u64>,
+    by_id: &HashMap<uuid::Uuid, &Issue>,
+) -> WayfinderChild {
+    let blockers = parse_uuid_references(&issue.body)
+        .into_iter()
+        .filter(|id| {
+            by_id
+                .get(id)
+                .map(|blocker| blocker.status != Status::Closed)
+                .unwrap_or(true)
+        })
+        .filter_map(|id| numbers.get(&id).copied())
+        .collect::<Vec<_>>();
+    let github_issue = local_issue(issue, numbers[&issue.id], blockers);
+    let state = classify_issue(&github_issue);
+    WayfinderChild {
+        issue: github_issue,
+        state,
+    }
+}
+
+fn local_issue(issue: &Issue, number: u64, open_blockers: Vec<u64>) -> GitHubIssue {
+    GitHubIssue {
+        number,
+        title: issue.title.clone(),
+        state: match issue.status {
+            Status::Open => IssueState::Open,
+            Status::Closed | Status::Archived => IssueState::Closed,
+        },
+        body: issue.body.clone(),
+        comments: Vec::new(),
+        labels: issue_labels(issue),
+        assignees: Vec::new(),
+        open_blockers,
+    }
+}
+
+fn issue_labels(issue: &Issue) -> Vec<String> {
+    issue
+        .extra
+        .get("labels")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_parent_id(body: &str) -> Option<uuid::Uuid> {
+    body.lines().take(12).find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        let value = lower
+            .find("parent:")
+            .map(|index| &line[index + "parent:".len()..])?;
+        value.split_whitespace().find_map(|part| {
+            uuid::Uuid::parse_str(
+                part.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-'),
+            )
+            .ok()
+        })
+    })
+}
+
+fn parse_uuid_references(body: &str) -> Vec<uuid::Uuid> {
+    body.lines()
+        .take(12)
+        .filter_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower
+                .find("blocked by:")
+                .map(|index| &line[index + "blocked by:".len()..])
+        })
+        .flat_map(|value| value.split(|ch: char| ch == ',' || ch.is_whitespace()))
+        .filter_map(|part| {
+            uuid::Uuid::parse_str(
+                part.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-'),
+            )
+            .ok()
+        })
+        .collect()
 }
 
 pub fn parse_wayfinder_maps(json: &str) -> Result<MapData, GitHubError> {
@@ -800,6 +949,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![11, 12]
         );
+    }
+
+    #[test]
+    fn loads_local_maps_and_uuid_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_id = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let blocker_id = uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let child_id = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let labels = |values: &[&str]| {
+            toml::Value::Array(
+                values
+                    .iter()
+                    .map(|value| toml::Value::String((*value).to_string()))
+                    .collect(),
+            )
+        };
+        for issue in [
+            Issue {
+                id: map_id,
+                title: "Local map".to_string(),
+                status: Status::Open,
+                body: String::new(),
+                extra: HashMap::from([(String::from("labels"), labels(&["wayfinder:map"]))]),
+            },
+            Issue {
+                id: blocker_id,
+                title: "Blocker".to_string(),
+                status: Status::Open,
+                body: String::new(),
+                extra: HashMap::new(),
+            },
+            Issue {
+                id: child_id,
+                title: "Child".to_string(),
+                status: Status::Open,
+                body: format!("Parent: {map_id}\nBlocked by: {blocker_id}\n"),
+                extra: HashMap::new(),
+            },
+        ] {
+            crate::tracker::write_issue_file(&issue, dir.path()).unwrap();
+        }
+
+        let maps = fetch_local_wayfinder_maps(dir.path()).unwrap();
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].issue.title, "Local map");
+        assert_eq!(maps[0].children.len(), 1);
+        assert_eq!(maps[0].children[0].issue.title, "Child");
+        assert_eq!(maps[0].children[0].issue.open_blockers, vec![2]);
+        assert_eq!(maps[0].children[0].state, FrontierState::Blocked);
     }
 
     #[test]
