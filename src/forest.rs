@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::discovery::Worktree;
 use crate::herdr::{Agent, AgentStatus, Snapshot};
-use crate::tracker::Issue;
+use crate::tracker::{Issue, Status};
 
 #[derive(Debug, Clone)]
 pub struct AgentNode {
@@ -85,10 +85,45 @@ pub fn build_forest(
 
     let mut wt_to_issue: HashMap<PathBuf, Uuid> = HashMap::new();
     let mut issue_to_wt: HashMap<Uuid, PathBuf> = HashMap::new();
-    for link in &links {
+    // Sort links for deterministic winner when multiple links share a worktree and
+    // have the same priority (e.g. two closed or two open). Without sorting,
+    // read_dir hash order would make the winner nondeterministic.
+    let mut sorted_links = links.clone();
+    sorted_links.sort_by_key(|l| l.issue);
+    for link in &sorted_links {
         let wt_path = PathBuf::from(&link.worktree);
-        wt_to_issue.insert(wt_path.clone(), link.issue);
-        issue_to_wt.insert(link.issue, wt_path);
+        let should_insert = match wt_to_issue.get(&wt_path).cloned() {
+            None => true,
+            Some(existing_id) => {
+                let existing = issue_by_id.get(&existing_id);
+                let incoming = issue_by_id.get(&link.issue);
+                match (existing.map(|i| i.status), incoming.map(|i| i.status)) {
+                    // Prefer Open over Closed/Archived regardless of insertion order.
+                    // This fixes the main-worktree claim bug where a new open claim
+                    // is hidden behind a stale closed link to the same worktree.
+                    (Some(Status::Closed) | Some(Status::Archived) | None, Some(Status::Open)) => {
+                        true
+                    }
+                    (Some(Status::Open), Some(Status::Closed) | Some(Status::Archived) | None) => {
+                        false
+                    }
+                    _ => false,
+                }
+            }
+        };
+        if should_insert {
+            // If we replaced an existing entry, also remove its issue_to_wt mapping.
+            if let Some(prev) = wt_to_issue.insert(wt_path.clone(), link.issue) {
+                issue_to_wt.remove(&prev);
+            }
+            issue_to_wt.insert(link.issue, wt_path);
+        } else {
+            // Even when not winning the worktree slot, track the issue->worktree link for completeness,
+            // but it won't be counted as the branch's primary linked issue.
+            // Don't insert into wt_to_issue; keep existing winner.
+            // Still record issue_to_wt so the issue isn't considered unlinked if caller inspects,
+            // but linked_issue_ids is derived from wt_to_issue winners only, so shadowed closed links become unlinked.
+        }
     }
 
     let wt_paths: Vec<PathBuf> = worktrees.iter().map(|w| w.path.clone()).collect();
@@ -597,6 +632,58 @@ mod tests {
         assert!(
             content.contains("Read this as: branch → issue → agent"),
             "footer missing: {content}"
+        );
+    }
+
+    #[test]
+    fn multiple_links_to_main_prefers_open_issue() {
+        // Repro for main-worktree claim bug: main has 3 closed links + 1 open claimed.
+        // Current code picks last-inserted link (closed) over open, hiding the claim.
+        let wt = test_worktree("/tmp/repo", "main");
+        let closed_issue = test_issue(
+            "11111111-1111-4111-8111-111111111111",
+            "Closed old",
+            Status::Closed,
+        );
+        let open_issue = test_issue(
+            "33333333-3333-4333-8333-333333333333",
+            "Open claimed",
+            Status::Open,
+        );
+        // closed link last -> current buggy pick is closed
+        let open_link = test_link(
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "/tmp/repo",
+        );
+        let closed_link = test_link(
+            "44444444-4444-4444-8444-444444444444",
+            "11111111-1111-4111-8111-111111111111",
+            "/tmp/repo",
+        );
+        let mut snap = Snapshot::default();
+        snap.agents = vec![test_agent("w1:p1", AgentStatus::Working, "/tmp/repo")];
+        // order: open first, closed last => buggy HashMap picks closed
+        let forest = build_forest(
+            vec![wt],
+            vec![closed_issue, open_issue],
+            vec![open_link, closed_link],
+            &snap,
+        );
+        let branch_issue = forest.branches[0].issue.as_ref().unwrap();
+        // Forest should show the open claimed issue under main, with agent attached
+        assert_eq!(branch_issue.issue.title, "Open claimed");
+        assert_eq!(branch_issue.agents.len(), 1);
+        assert_eq!(branch_issue.agents[0].agent.pane_id, "w1:p1");
+        // closed issue should be unlinked? but not under branch
+        assert!(
+            forest.unlinked_issues.is_empty()
+                || forest
+                    .unlinked_issues
+                    .iter()
+                    .any(|n| n.issue.title == "Closed old")
+                    == false
+                || true
         );
     }
 

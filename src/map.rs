@@ -225,11 +225,13 @@ fn write_child(area: Rect, y: u16, child: &WayfinderChild, selected: bool, buf: 
     } else {
         Style::default().fg(color)
     };
-    let label = child.issue.labels.iter().find_map(|label| {
-        label
-            .strip_prefix("wayfinder:")
-            .filter(|name| *name != "map")
-    });
+    let labels = child
+        .issue
+        .labels
+        .iter()
+        .filter(|label| label.as_str() != "wayfinder:map")
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let blocker_text = if child.issue.open_blockers.is_empty() {
         None
     } else {
@@ -250,9 +252,9 @@ fn write_child(area: Rect, y: u16, child: &WayfinderChild, selected: bool, buf: 
         Span::styled(format!("#{} ", child.issue.number), style),
         Span::styled(child.issue.title.clone(), style),
     ];
-    if let Some(label) = label {
+    if !labels.is_empty() {
         spans.push(Span::styled(
-            format!("  [{label}]"),
+            format!("  [{}]", labels.join(", ")),
             style.fg(Color::DarkGray),
         ));
     }
@@ -319,7 +321,11 @@ mod tests {
                 },
                 body: String::new(),
                 comments: Vec::new(),
-                labels: Vec::new(),
+                labels: if number == 2 {
+                    vec!["wayfinder:task".to_string(), "ready-for-human".to_string()]
+                } else {
+                    Vec::new()
+                },
                 assignees: Vec::new(),
                 open_blockers: if state == FrontierState::Blocked {
                     vec![4]
@@ -405,7 +411,7 @@ mod tests {
         assert!(rendered.contains("─ Blocked (1)"));
         assert!(rendered.contains("─ Assigned (1)"));
         assert!(rendered.contains("─ Done (1)"));
-        assert!(rendered.contains("#2 Frontier issue"));
+        assert!(rendered.contains("#2 Frontier issue  [wayfinder:task, ready-for-human]"));
         assert!(rendered.contains("#5 Blocked issue  blocked by #4"));
         assert!(!rendered.contains("WORKTREES"));
         assert!(!rendered.contains("agent"));

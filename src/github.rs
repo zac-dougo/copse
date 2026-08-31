@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
-use crate::tracker::{Issue, Status, load_issues};
+use crate::tracker::{Issue, Status, load_issues, load_links};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -269,6 +269,34 @@ pub fn fetch_local_wayfinder_maps(issues_dir: &Path) -> Result<MapData, GitHubEr
         .map(|issue| (issue.id, issue))
         .collect::<HashMap<_, _>>();
 
+    // Links indicate a claim. For Copse, a linked open issue is Assigned (the
+    // local equivalent of GitHub assignees). Infer links_dir as sibling of
+    // issues_dir (.copse/issues -> .copse/links) which covers App's board layout
+    // and the new test layout (tmp/issues + tmp/links).
+    let linked_ids: HashSet<uuid::Uuid> = {
+        let mut set = HashSet::new();
+        if let Some(parent) = issues_dir.parent() {
+            let candidate = parent.join("links");
+            if let Ok(links) = load_links(&candidate) {
+                for link in links {
+                    set.insert(link.issue);
+                }
+            }
+        }
+        // Fallback: if issues_dir itself is the temp dir that directly contains
+        // link files (older unit test layout), also check there.
+        if set.is_empty() {
+            if let Ok(links) = load_links(issues_dir) {
+                for link in links {
+                    // Only treat as linked if the file actually parses as a link;
+                    // issue files in same dir will be ignored by load_links (parse fails) and are skipped.
+                    set.insert(link.issue);
+                }
+            }
+        }
+        set
+    };
+
     let mut maps = issues
         .iter()
         .filter(|issue| {
@@ -280,10 +308,10 @@ pub fn fetch_local_wayfinder_maps(issues_dir: &Path) -> Result<MapData, GitHubEr
             let children = issues
                 .iter()
                 .filter(|issue| parse_parent_id(&issue.body) == Some(map.id))
-                .map(|child| local_child(child, &numbers, &by_id))
+                .map(|child| local_child(child, &numbers, &by_id, &linked_ids))
                 .collect::<Vec<_>>();
             WayfinderMap {
-                issue: local_issue(map, numbers[&map.id], Vec::new()),
+                issue: local_issue_with_assignees(map, numbers[&map.id], Vec::new(), false),
                 open_child_count: children
                     .iter()
                     .filter(|child| child.issue.state == IssueState::Open)
@@ -300,6 +328,7 @@ fn local_child(
     issue: &Issue,
     numbers: &HashMap<uuid::Uuid, u64>,
     by_id: &HashMap<uuid::Uuid, &Issue>,
+    linked_ids: &HashSet<uuid::Uuid>,
 ) -> WayfinderChild {
     let blockers = parse_uuid_references(&issue.body)
         .into_iter()
@@ -311,7 +340,8 @@ fn local_child(
         })
         .filter_map(|id| numbers.get(&id).copied())
         .collect::<Vec<_>>();
-    let github_issue = local_issue(issue, numbers[&issue.id], blockers);
+    let is_linked = linked_ids.contains(&issue.id);
+    let github_issue = local_issue_with_assignees(issue, numbers[&issue.id], blockers, is_linked);
     let state = classify_issue(&github_issue);
     WayfinderChild {
         issue: github_issue,
@@ -320,6 +350,15 @@ fn local_child(
 }
 
 fn local_issue(issue: &Issue, number: u64, open_blockers: Vec<u64>) -> GitHubIssue {
+    local_issue_with_assignees(issue, number, open_blockers, false)
+}
+
+fn local_issue_with_assignees(
+    issue: &Issue,
+    number: u64,
+    open_blockers: Vec<u64>,
+    is_linked: bool,
+) -> GitHubIssue {
     GitHubIssue {
         number,
         title: issue.title.clone(),
@@ -330,7 +369,12 @@ fn local_issue(issue: &Issue, number: u64, open_blockers: Vec<u64>) -> GitHubIss
         body: issue.body.clone(),
         comments: Vec::new(),
         labels: issue_labels(issue),
-        assignees: Vec::new(),
+        // For local Copse, a link is the claim signal, equivalent to GitHub assignee.
+        assignees: if is_linked {
+            vec!["linked".to_string()]
+        } else {
+            Vec::new()
+        },
         open_blockers,
     }
 }
@@ -998,6 +1042,84 @@ mod tests {
         assert_eq!(maps[0].children[0].issue.title, "Child");
         assert_eq!(maps[0].children[0].issue.open_blockers, vec![2]);
         assert_eq!(maps[0].children[0].state, FrontierState::Blocked);
+    }
+
+    #[test]
+    fn local_map_linked_issue_is_assigned() {
+        // Repro for claim label bug: linked open child should be Assigned, not Frontier.
+        // Currently fetch_local_wayfinder_maps ignores .copse/links, so linked child stays Frontier.
+        let dir = tempfile::tempdir().unwrap();
+        let issues_dir = dir.path().join("issues");
+        let links_dir = dir.path().join("links");
+        std::fs::create_dir_all(&issues_dir).unwrap();
+        std::fs::create_dir_all(&links_dir).unwrap();
+        let map_id = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let child_open_id = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let child_linked_id =
+            uuid::Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
+        let labels = |values: &[&str]| {
+            toml::Value::Array(
+                values
+                    .iter()
+                    .map(|value| toml::Value::String((*value).to_string()))
+                    .collect(),
+            )
+        };
+        for issue in [
+            Issue {
+                id: map_id,
+                title: "Local map".to_string(),
+                status: Status::Open,
+                body: String::new(),
+                extra: HashMap::from([(String::from("labels"), labels(&["wayfinder:map"]))]),
+            },
+            Issue {
+                id: child_open_id,
+                title: "Frontier child".to_string(),
+                status: Status::Open,
+                body: format!("Parent: {map_id}\n"),
+                extra: HashMap::new(),
+            },
+            Issue {
+                id: child_linked_id,
+                title: "Linked child".to_string(),
+                status: Status::Open,
+                body: format!("Parent: {map_id}\n"),
+                extra: HashMap::new(),
+            },
+        ] {
+            crate::tracker::write_issue_file(&issue, &issues_dir).unwrap();
+        }
+        // Link the second child to main worktree, simulating a claim still on main
+        let link = crate::tracker::Link {
+            id: uuid::Uuid::new_v4(),
+            issue: child_linked_id,
+            worktree: "/tmp/repo".to_string(),
+            body: String::new(),
+            extra: HashMap::new(),
+        };
+        crate::tracker::write_link_file(&link, &links_dir).unwrap();
+
+        // Before fix: both children Frontier. After fix: linked one Assigned.
+        // Use fetch_local_wayfinder_maps_with_links if available, else fetch_local_wayfinder_maps should consider links.
+        let maps = fetch_local_wayfinder_maps(&issues_dir).unwrap();
+        // This will be red until fetch_local_wayfinder_maps checks links. Force the assertion to expose bug:
+        // We expect 2 children, one Frontier one Assigned, but current code gives 2 Frontier.
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].children.len(), 2);
+        let mut states = maps[0]
+            .children
+            .iter()
+            .map(|c| (c.issue.title.clone(), c.state))
+            .collect::<Vec<_>>();
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        // Frontier child should stay Frontier, linked should be Assigned
+        assert_eq!(states[0].1, FrontierState::Frontier, "Frontier child");
+        assert_eq!(
+            states[1].1,
+            FrontierState::Assigned,
+            "Linked child should be Assigned when link exists"
+        );
     }
 
     #[test]
