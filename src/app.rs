@@ -605,6 +605,35 @@ impl App {
 
 // Rendering helpers
 
+pub fn draw_view_tabs(view: View, area: Rect, buf: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let tab_style = |active| {
+        if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            "Views ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("[1 Forest]", tab_style(view == View::Forest)),
+        Span::raw(" "),
+        Span::styled("[2 Map]", tab_style(view == View::Map)),
+    ]);
+    buf.set_line(area.x + 2, area.y, &line, area.width.saturating_sub(2));
+}
+
 pub fn draw_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
     let view_label = match app.view {
         View::Forest => " Forest ",
@@ -862,6 +891,13 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                     .split(area);
                 let main_area = chunks[0];
                 let status_area = chunks[1];
+                let content_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(0)])
+                    .split(main_area);
+                let view_tabs_area = content_chunks[0];
+                let content_area = content_chunks[1];
+                draw_view_tabs(app.view, view_tabs_area, f.buffer_mut());
 
                 match app.view {
                     View::Forest => {
@@ -872,7 +908,7 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                                     Constraint::Percentage(60),
                                     Constraint::Percentage(40),
                                 ])
-                                .split(main_area);
+                                .split(content_area);
                             let forest_area = cols[0];
                             let detail_area = cols[1];
                             ForestWidget {
@@ -886,7 +922,7 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                                 forest: &app.forest,
                                 selected: Some(app.selected),
                             }
-                            .render(main_area, f.buffer_mut());
+                            .render(content_area, f.buffer_mut());
                         }
                     }
                     View::Map => {
@@ -897,7 +933,7 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                                     Constraint::Percentage(68),
                                     Constraint::Percentage(32),
                                 ])
-                                .split(main_area);
+                                .split(content_area);
                             let map_area = cols[0];
                             let detail_area = cols[1];
                             MapWidget {
@@ -917,7 +953,7 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                                     .current_map_child()
                                     .map(|_| app.selected_map_child),
                             }
-                            .render(main_area, f.buffer_mut());
+                            .render(content_area, f.buffer_mut());
                         }
                     }
                 }
@@ -1203,6 +1239,19 @@ mod tests {
         assert_eq!(app.selected_map_child, 1);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.selected_map, 0);
+    }
+
+    #[test]
+    fn view_tabs_show_both_views_and_highlight_the_current_one() {
+        let area = Rect::new(0, 0, 50, 1);
+        let mut buf = Buffer::empty(area);
+        draw_view_tabs(View::Map, area, &mut buf);
+        let rendered: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+
+        assert!(rendered.contains("Views [1 Forest] [2 Map]"));
+        assert!((0..area.width).any(|x| buf[(x, 0)].bg == Color::Cyan));
     }
 
     #[test]

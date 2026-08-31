@@ -39,6 +39,10 @@ impl<'a> Widget for MapWidget<'a> {
         if !self.maps.is_empty() && y < footer_y {
             render_map_tabs(self.maps, self.selected_map, area, y, buf);
             y += 1;
+            if y < footer_y {
+                render_map_separator(area, y, buf);
+                y += 1;
+            }
         }
 
         if let Some(map) = self.maps.get(self.selected_map) {
@@ -105,7 +109,9 @@ fn render_map_header(
 fn render_map_tabs(maps: &MapData, selected_map: usize, area: Rect, y: u16, buf: &mut Buffer) {
     let mut spans = vec![Span::styled(
         "Maps ",
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )];
     for (index, map) in maps.iter().enumerate() {
         let style = if index == selected_map {
@@ -130,6 +136,19 @@ fn render_map_tabs(maps: &MapData, selected_map: usize, area: Rect, y: u16, buf:
         y,
         area.width.saturating_sub(2),
         Line::from(spans),
+    );
+}
+
+fn render_map_separator(area: Rect, y: u16, buf: &mut Buffer) {
+    write_line(
+        buf,
+        area.x,
+        y,
+        area.width,
+        Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(Color::Cyan),
+        )),
     );
 }
 
@@ -363,6 +382,8 @@ mod tests {
         let rendered = content(&buf, area);
         assert!(rendered.contains("Maps [#10 Copse map] [#20 Second map]"));
         assert!((0..area.width).any(|x| buf[(x, 1)].bg == Color::Cyan));
+        assert_eq!(buf[(0, 2)].symbol(), "─");
+        assert_eq!(buf[(0, 2)].fg, Color::Cyan);
     }
 
     #[test]
