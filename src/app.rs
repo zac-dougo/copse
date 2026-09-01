@@ -914,6 +914,8 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                             ForestWidget {
                                 forest: &app.forest,
                                 selected: Some(app.selected),
+                                expanded_branches: Some(&app.expanded_branches),
+                                expanded_issues: Some(&app.expanded_issues),
                             }
                             .render(forest_area, f.buffer_mut());
                             draw_detail(&app, detail_area, f.buffer_mut());
@@ -921,6 +923,8 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                             ForestWidget {
                                 forest: &app.forest,
                                 selected: Some(app.selected),
+                                expanded_branches: Some(&app.expanded_branches),
+                                expanded_issues: Some(&app.expanded_issues),
                             }
                             .render(content_area, f.buffer_mut());
                         }

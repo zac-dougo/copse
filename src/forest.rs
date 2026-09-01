@@ -235,6 +235,8 @@ pub fn build_forest(
 pub struct ForestWidget<'a> {
     pub forest: &'a Forest,
     pub selected: Option<usize>,
+    pub expanded_branches: Option<&'a HashSet<PathBuf>>,
+    pub expanded_issues: Option<&'a HashSet<Uuid>>,
 }
 
 impl<'a> Widget for ForestWidget<'a> {
@@ -245,6 +247,17 @@ impl<'a> Widget for ForestWidget<'a> {
         let mut y = area.y;
         let max_y = area.y + area.height;
         let max_x = area.x + area.width;
+        // Track flat index for selection highlight. Flat nodes are branch, issue,
+        // agent in that order, respecting expanded state. Headers and blank rows
+        // are not flat nodes.
+        let mut flat_idx: usize = 0;
+        let is_selected = |idx: usize| self.selected == Some(idx);
+        let highlight = |mut style: Style, selected: bool| {
+            if selected {
+                style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+            }
+            style
+        };
 
         // Header: repository
         if y < max_y {
@@ -274,69 +287,180 @@ impl<'a> Widget for ForestWidget<'a> {
             } else {
                 Style::default().fg(Color::White)
             };
+            // Branch line is a flat node - check selection
+            let sel_branch = is_selected(flat_idx);
             let branch_line = Line::from(vec![
-                Span::styled(joint.to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    joint.to_string(),
+                    highlight(Style::default().fg(Color::DarkGray), sel_branch),
+                ),
                 Span::raw(" "),
-                Span::styled(branch.branch_name.clone(), branch_style),
+                Span::styled(
+                    branch.branch_name.clone(),
+                    highlight(branch_style, sel_branch),
+                ),
             ]);
-            buf.set_line(area.x + 2, y, &branch_line, area.width.saturating_sub(2));
-            y += 1;
-            if y >= max_y {
-                break;
-            }
-
-            // Issue line
-            let issue_line = if let Some(issue_node) = &branch.issue {
-                Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled("issue  ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(issue_node.issue.title.clone()),
-                ])
+            // Use a gutter indicator for selected branch
+            let branch_x = if sel_branch { area.x } else { area.x + 2 };
+            let branch_width = if sel_branch {
+                area.width
             } else {
-                Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled("issue  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("No linked issue", Style::default().fg(Color::DarkGray)),
-                ])
+                area.width.saturating_sub(2)
             };
-            buf.set_line(area.x, y, &issue_line, area.width);
+            if sel_branch {
+                // Draw a marker in the gutter
+                buf.set_line(
+                    branch_x + 2,
+                    y,
+                    &branch_line,
+                    branch_width.saturating_sub(2),
+                );
+                for x in area.x..area.x + area.width {
+                    let s = buf[(x, y)].style().bg(Color::DarkGray);
+                    buf[(x, y)].set_style(s);
+                }
+                buf[(area.x, y)].set_symbol("▸");
+                buf[(area.x, y)].set_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                );
+            } else {
+                buf.set_line(area.x + 2, y, &branch_line, area.width.saturating_sub(2));
+            }
             y += 1;
+            flat_idx += 1;
             if y >= max_y {
                 break;
             }
 
-            // Agent line(s) — for prototype, one line per worktree; if multiple agents, show each
-            if let Some(issue_node) = &branch.issue {
-                if issue_node.agents.is_empty() {
-                    // No agent linked to this issue's worktree
-                    let line = Line::from(vec![
-                        Span::raw("      "),
-                        Span::styled("agent  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("—  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("· no agent", Style::default().fg(Color::DarkGray)),
-                    ]);
-                    buf.set_line(area.x, y, &line, area.width);
+            // Respect collapsed state: if branch is collapsed, skip issue/agent rendering
+            let branch_expanded = self
+                .expanded_branches
+                .map_or(true, |set| set.contains(&branch.worktree.path));
+            if !branch_expanded {
+                if y < max_y {
                     y += 1;
+                }
+                continue;
+            }
+
+            // Issue line - only a flat node if branch has an issue
+            if let Some(issue_node) = &branch.issue {
+                let sel_issue = is_selected(flat_idx);
+                let issue_line = Line::from(vec![
+                    Span::styled(
+                        "      ",
+                        highlight(Style::default().fg(Color::DarkGray), sel_issue),
+                    ),
+                    Span::styled(
+                        "issue  ",
+                        highlight(Style::default().fg(Color::DarkGray), sel_issue),
+                    ),
+                    Span::styled(
+                        issue_node.issue.title.clone(),
+                        highlight(Style::default().fg(Color::White), sel_issue),
+                    ),
+                ]);
+                if sel_issue {
+                    buf.set_line(area.x, y, &issue_line, area.width);
+                    for x in area.x..area.x + area.width {
+                        let s = buf[(x, y)].style().bg(Color::DarkGray);
+                        buf[(x, y)].set_style(s);
+                    }
+                    buf[(area.x, y)].set_symbol("▸");
+                    buf[(area.x, y)].set_style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    );
                 } else {
-                    for agent_node in &issue_node.agents {
-                        if y >= max_y {
-                            break;
-                        }
+                    buf.set_line(area.x, y, &issue_line, area.width);
+                }
+                y += 1;
+                flat_idx += 1;
+                if y >= max_y {
+                    break;
+                }
+
+                let issue_expanded = self
+                    .expanded_issues
+                    .map_or(true, |set| set.contains(&issue_node.issue.id));
+                if !issue_expanded {
+                    if y < max_y {
+                        // still need to handle agent placeholder? No, collapsed issue hides agents
+                    }
+                } else {
+                    // Agent line(s) — for prototype, one line per worktree; if multiple agents, show each
+                    if issue_node.agents.is_empty() {
+                        // No agent linked - this is not a flat node, just a placeholder
                         let line = Line::from(vec![
                             Span::raw("      "),
                             Span::styled("agent  ", Style::default().fg(Color::DarkGray)),
-                            Span::raw(format!("{}  ", agent_node.agent.agent)),
-                            Span::styled(
-                                agent_node.badge.clone(),
-                                Style::default().fg(agent_node.color),
-                            ),
+                            Span::styled("—  ", Style::default().fg(Color::DarkGray)),
+                            Span::styled("· no agent", Style::default().fg(Color::DarkGray)),
                         ]);
                         buf.set_line(area.x, y, &line, area.width);
                         y += 1;
+                    } else {
+                        for agent_node in &issue_node.agents {
+                            if y >= max_y {
+                                break;
+                            }
+                            let sel_agent = is_selected(flat_idx);
+                            let line = Line::from(vec![
+                                Span::styled(
+                                    "      ",
+                                    highlight(Style::default().fg(Color::DarkGray), sel_agent),
+                                ),
+                                Span::styled(
+                                    "agent  ",
+                                    highlight(Style::default().fg(Color::DarkGray), sel_agent),
+                                ),
+                                Span::styled(
+                                    format!("{}  ", agent_node.agent.agent),
+                                    highlight(Style::default().fg(Color::White), sel_agent),
+                                ),
+                                Span::styled(
+                                    agent_node.badge.clone(),
+                                    highlight(Style::default().fg(agent_node.color), sel_agent),
+                                ),
+                            ]);
+                            if sel_agent {
+                                buf.set_line(area.x, y, &line, area.width);
+                                for x in area.x..area.x + area.width {
+                                    let s = buf[(x, y)].style().bg(Color::DarkGray);
+                                    buf[(x, y)].set_style(s);
+                                }
+                                buf[(area.x, y)].set_symbol("▸");
+                                buf[(area.x, y)].set_style(
+                                    Style::default()
+                                        .fg(Color::Cyan)
+                                        .bg(Color::DarkGray)
+                                        .add_modifier(Modifier::BOLD),
+                                );
+                            } else {
+                                buf.set_line(area.x, y, &line, area.width);
+                            }
+                            y += 1;
+                            flat_idx += 1;
+                        }
                     }
                 }
             } else {
-                // No issue, show no agent as well
+                // No linked issue - placeholder, not a flat node
+                let line = Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled("issue  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("No linked issue", Style::default().fg(Color::DarkGray)),
+                ]);
+                buf.set_line(area.x, y, &line, area.width);
+                y += 1;
+                if y >= max_y {
+                    break;
+                }
                 let line = Line::from(vec![
                     Span::raw("      "),
                     Span::styled("agent  ", Style::default().fg(Color::DarkGray)),
@@ -365,13 +489,39 @@ impl<'a> Widget for ForestWidget<'a> {
                 if y >= max_y {
                     break;
                 }
+                let sel_unlinked = is_selected(flat_idx);
                 let line = Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled("issue  ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(issue_node.issue.title.clone()),
+                    Span::styled(
+                        "      ",
+                        highlight(Style::default().fg(Color::DarkGray), sel_unlinked),
+                    ),
+                    Span::styled(
+                        "issue  ",
+                        highlight(Style::default().fg(Color::DarkGray), sel_unlinked),
+                    ),
+                    Span::styled(
+                        issue_node.issue.title.clone(),
+                        highlight(Style::default().fg(Color::White), sel_unlinked),
+                    ),
                 ]);
-                buf.set_line(area.x, y, &line, area.width);
+                if sel_unlinked {
+                    buf.set_line(area.x, y, &line, area.width);
+                    for x in area.x..area.x + area.width {
+                        let s = buf[(x, y)].style().bg(Color::DarkGray);
+                        buf[(x, y)].set_style(s);
+                    }
+                    buf[(area.x, y)].set_symbol("▸");
+                    buf[(area.x, y)].set_style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                } else {
+                    buf.set_line(area.x, y, &line, area.width);
+                }
                 y += 1;
+                flat_idx += 1;
             }
         }
 
@@ -602,6 +752,8 @@ mod tests {
         ForestWidget {
             forest: &forest,
             selected: None,
+            expanded_branches: None,
+            expanded_issues: None,
         }
         .render(area, &mut buf);
 
@@ -685,6 +837,66 @@ mod tests {
                     == false
                 || true
         );
+    }
+
+    #[test]
+    fn selected_forest_row_is_highlighted() {
+        let wt = test_worktree("/tmp/repo", "main");
+        let issue = test_issue(
+            "11111111-1111-4111-8111-111111111111",
+            "My Issue",
+            Status::Open,
+        );
+        let link = test_link(
+            "22222222-2222-4222-8222-222222222222",
+            "11111111-1111-4111-8111-111111111111",
+            "/tmp/repo",
+        );
+        let mut snap = Snapshot::default();
+        snap.agents = vec![test_agent("w1:p1", AgentStatus::Working, "/tmp/repo")];
+        let forest = build_forest(vec![wt], vec![issue], vec![link], &snap);
+        // Flat order is branch(0), issue(1), agent(2). Test each selection.
+        for (selected, expected_y) in [(0usize, 2), (1, 3), (2, 4)] {
+            let area = Rect::new(0, 0, 80, 20);
+            let mut buf = Buffer::empty(area);
+            ForestWidget {
+                forest: &forest,
+                selected: Some(selected),
+                expanded_branches: None,
+                expanded_issues: None,
+            }
+            .render(area, &mut buf);
+            // Selected row should have DarkGray bg and gutter marker
+            assert_eq!(
+                buf[(0, expected_y)].bg,
+                Color::DarkGray,
+                "selected {selected} should highlight y {expected_y}"
+            );
+            assert_eq!(buf[(0, expected_y)].symbol(), "▸");
+            // Other rows should not be highlighted
+            for y in [2, 3, 4] {
+                if y != expected_y {
+                    assert_ne!(
+                        buf[(0, y)].bg,
+                        Color::DarkGray,
+                        "unselected y {y} should not be highlighted when selected is {selected}"
+                    );
+                }
+            }
+        }
+        // No selection => no highlight
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        ForestWidget {
+            forest: &forest,
+            selected: None,
+            expanded_branches: None,
+            expanded_issues: None,
+        }
+        .render(area, &mut buf);
+        for y in [2, 3, 4] {
+            assert_ne!(buf[(0, y)].bg, Color::DarkGray);
+        }
     }
 
     #[test]
