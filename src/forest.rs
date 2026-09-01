@@ -254,7 +254,10 @@ impl<'a> Widget for ForestWidget<'a> {
         let is_selected = |idx: usize| self.selected == Some(idx);
         let highlight = |mut style: Style, selected: bool| {
             if selected {
-                style = style.bg(Color::Gray).add_modifier(Modifier::BOLD);
+                style = style
+                    .bg(Color::White)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD);
             }
             style
         };
@@ -316,14 +319,14 @@ impl<'a> Widget for ForestWidget<'a> {
                     branch_width.saturating_sub(2),
                 );
                 for x in area.x..area.x + area.width {
-                    let s = buf[(x, y)].style().bg(Color::Gray);
+                    let s = buf[(x, y)].style().bg(Color::White).fg(Color::Black);
                     buf[(x, y)].set_style(s);
                 }
                 buf[(area.x, y)].set_symbol("▸");
                 buf[(area.x, y)].set_style(
                     Style::default()
-                        .fg(Color::Cyan)
-                        .bg(Color::Gray)
+                        .fg(Color::Black)
+                        .bg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 );
             } else {
@@ -366,14 +369,14 @@ impl<'a> Widget for ForestWidget<'a> {
                 if sel_issue {
                     buf.set_line(area.x, y, &issue_line, area.width);
                     for x in area.x..area.x + area.width {
-                        let s = buf[(x, y)].style().bg(Color::Gray);
+                        let s = buf[(x, y)].style().bg(Color::White).fg(Color::Black);
                         buf[(x, y)].set_style(s);
                     }
                     buf[(area.x, y)].set_symbol("▸");
                     buf[(area.x, y)].set_style(
                         Style::default()
                             .fg(Color::Cyan)
-                            .bg(Color::Gray)
+                            .bg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     );
                 } else {
@@ -431,14 +434,14 @@ impl<'a> Widget for ForestWidget<'a> {
                             if sel_agent {
                                 buf.set_line(area.x, y, &line, area.width);
                                 for x in area.x..area.x + area.width {
-                                    let s = buf[(x, y)].style().bg(Color::Gray);
+                                    let s = buf[(x, y)].style().bg(Color::White).fg(Color::Black);
                                     buf[(x, y)].set_style(s);
                                 }
                                 buf[(area.x, y)].set_symbol("▸");
                                 buf[(area.x, y)].set_style(
                                     Style::default()
                                         .fg(Color::Cyan)
-                                        .bg(Color::Gray)
+                                        .bg(Color::White)
                                         .add_modifier(Modifier::BOLD),
                                 );
                             } else {
@@ -507,14 +510,14 @@ impl<'a> Widget for ForestWidget<'a> {
                 if sel_unlinked {
                     buf.set_line(area.x, y, &line, area.width);
                     for x in area.x..area.x + area.width {
-                        let s = buf[(x, y)].style().bg(Color::Gray);
+                        let s = buf[(x, y)].style().bg(Color::White).fg(Color::Black);
                         buf[(x, y)].set_style(s);
                     }
                     buf[(area.x, y)].set_symbol("▸");
                     buf[(area.x, y)].set_style(
                         Style::default()
                             .fg(Color::Cyan)
-                            .bg(Color::Gray)
+                            .bg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     );
                 } else {
@@ -866,10 +869,10 @@ mod tests {
                 expanded_issues: None,
             }
             .render(area, &mut buf);
-            // Selected row should have DarkGray bg and gutter marker
+            // Selected row should have White bg and gutter marker
             assert_eq!(
                 buf[(0, expected_y)].bg,
-                Color::Gray,
+                Color::White,
                 "selected {selected} should highlight y {expected_y}"
             );
             assert_eq!(buf[(0, expected_y)].symbol(), "▸");
@@ -878,7 +881,7 @@ mod tests {
                 if y != expected_y {
                     assert_ne!(
                         buf[(0, y)].bg,
-                        Color::Gray,
+                        Color::White,
                         "unselected y {y} should not be highlighted when selected is {selected}"
                     );
                 }
@@ -895,7 +898,7 @@ mod tests {
         }
         .render(area, &mut buf);
         for y in [2, 3, 4] {
-            assert_ne!(buf[(0, y)].bg, Color::Gray);
+            assert_ne!(buf[(0, y)].bg, Color::White);
         }
     }
 

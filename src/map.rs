@@ -219,8 +219,8 @@ fn write_child(area: Rect, y: u16, child: &WayfinderChild, selected: bool, buf: 
     let color = child_color(child.state);
     let style = if selected {
         Style::default()
-            .fg(color)
-            .bg(Color::Gray)
+            .fg(Color::Black)
+            .bg(Color::White)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(color)
@@ -440,7 +440,7 @@ mod tests {
                     .contains("#2 Frontier issue")
             })
             .unwrap();
-        assert_eq!(buf[(2, y)].bg, Color::Gray);
+        assert_eq!(buf[(2, y)].bg, Color::White);
     }
 
     #[test]
