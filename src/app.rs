@@ -20,6 +20,7 @@ use crate::discovery::{BoardRepository, discover};
 use crate::forest::{Forest, ForestWidget, build_forest, render_markdown_to_text};
 use crate::github::{MapData, default_map_index, fetch_wayfinder_maps, map_index_for_number};
 use crate::herdr::{Snapshot, fetch_snapshot_blocking};
+use crate::issues::{IssuesData, IssuesWidget, build_issues_data};
 use crate::map::MapWidget;
 use crate::tracker::{load_issues, load_links};
 
@@ -34,6 +35,7 @@ pub enum SelectedKind {
 pub enum View {
     Forest,
     Map,
+    Issues,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +69,9 @@ pub struct App {
     pub selected_map_child: usize,
     pub map_detail_scroll: u16,
     pub stale_github: bool,
+    pub issues_data: IssuesData,
+    pub selected_issue: usize,
+    pub issues_detail_scroll: u16,
 }
 
 impl App {
@@ -93,6 +98,12 @@ impl App {
             }
         }
 
+        let issues_data = build_issues_data(
+            load_issues(&board.issues_dir).unwrap_or_default(),
+            load_links(&board.links_dir).unwrap_or_default(),
+            &snapshot,
+        );
+
         let mut app = Self {
             cwd,
             board,
@@ -115,8 +126,12 @@ impl App {
             selected_map_child: 0,
             map_detail_scroll: 0,
             stale_github,
+            issues_data,
+            selected_issue: 0,
+            issues_detail_scroll: 0,
         };
         app.selected_map_child = app.first_map_child();
+        app.selected_issue = app.first_issue();
         app.rebuild_flat();
         Ok(app)
     }
@@ -154,8 +169,12 @@ impl App {
             selected_map_child: 0,
             map_detail_scroll: 0,
             stale_github: false,
+            issues_data: IssuesData::default(),
+            selected_issue: 0,
+            issues_detail_scroll: 0,
         };
         app.selected_map_child = app.first_map_child();
+        app.selected_issue = app.first_issue();
         app.rebuild_flat();
         app
     }
@@ -226,6 +245,16 @@ impl App {
             }
             return;
         }
+        if self.view == View::Issues {
+            let order = self.issues_order();
+            if let Some(position) = order.iter().position(|index| *index == self.selected_issue)
+                && position > 0
+            {
+                self.selected_issue = order[position - 1];
+                self.issues_detail_scroll = 0;
+            }
+            return;
+        }
         if self.selected > 0 {
             self.selected -= 1;
         }
@@ -241,6 +270,16 @@ impl App {
             {
                 self.selected_map_child = order[position + 1];
                 self.map_detail_scroll = 0;
+            }
+            return;
+        }
+        if self.view == View::Issues {
+            let order = self.issues_order();
+            if let Some(position) = order.iter().position(|index| *index == self.selected_issue)
+                && position + 1 < order.len()
+            {
+                self.selected_issue = order[position + 1];
+                self.issues_detail_scroll = 0;
             }
             return;
         }
@@ -272,6 +311,32 @@ impl App {
 
     fn first_map_child(&self) -> usize {
         self.map_child_order().into_iter().next().unwrap_or(0)
+    }
+
+    fn issues_order(&self) -> Vec<usize> {
+        (0..self.issues_data.len()).collect()
+    }
+
+    fn first_issue(&self) -> usize {
+        self.issues_order().into_iter().next().unwrap_or(0)
+    }
+
+    fn current_issue(&self) -> Option<&crate::issues::IssueRow> {
+        self.issues_data.ordered().get(self.selected_issue).copied()
+    }
+
+    fn replace_issues_data(&mut self, data: IssuesData) {
+        let selected_id = self.current_issue().map(|row| row.issue.id);
+        self.issues_data = data;
+        self.selected_issue = selected_id
+            .and_then(|id| {
+                self.issues_data
+                    .ordered()
+                    .iter()
+                    .position(|row| row.issue.id == id)
+            })
+            .unwrap_or_else(|| self.first_issue());
+        self.issues_detail_scroll = 0;
     }
 
     fn next_map(&mut self) {
@@ -401,6 +466,27 @@ impl App {
                 _ => {}
             }
         }
+        if self.show_detail && self.view == View::Issues {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.issues_detail_scroll = self.issues_detail_scroll.saturating_sub(5);
+                    return false;
+                }
+                KeyCode::PageDown => {
+                    self.issues_detail_scroll = self.issues_detail_scroll.saturating_add(5);
+                    return false;
+                }
+                KeyCode::Home => {
+                    self.issues_detail_scroll = 0;
+                    return false;
+                }
+                KeyCode::End => {
+                    self.issues_detail_scroll = u16::MAX;
+                    return false;
+                }
+                _ => {}
+            }
+        }
 
         match key.code {
             KeyCode::Up => self.move_up(),
@@ -500,9 +586,13 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if self.view == View::Forest || self.current_map_child().is_some() {
+                if self.view == View::Forest
+                    || self.current_map_child().is_some()
+                    || (self.view == View::Issues && self.current_issue().is_some())
+                {
                     self.show_detail = !self.show_detail;
                     self.map_detail_scroll = 0;
+                    self.issues_detail_scroll = 0;
                 }
             }
             KeyCode::Char('r') => {
@@ -516,11 +606,19 @@ impl App {
                 self.view = View::Forest;
                 self.show_detail = false;
                 self.map_detail_scroll = 0;
+                self.issues_detail_scroll = 0;
             }
             KeyCode::Char('2') | KeyCode::Char('m') => {
                 self.view = View::Map;
                 self.show_detail = false;
                 self.map_detail_scroll = 0;
+                self.issues_detail_scroll = 0;
+            }
+            KeyCode::Char('3') | KeyCode::Char('i') => {
+                self.view = View::Issues;
+                self.show_detail = false;
+                self.map_detail_scroll = 0;
+                self.issues_detail_scroll = 0;
             }
             KeyCode::Tab if self.view == View::Map => self.next_map(),
             KeyCode::Char('q') => return true,
@@ -568,7 +666,12 @@ impl App {
             }
         }
 
-        let forest = build_forest(self.board.worktrees.clone(), issues, links, &self.snapshot);
+        let forest = build_forest(
+            self.board.worktrees.clone(),
+            issues.clone(),
+            links.clone(),
+            &self.snapshot,
+        );
         self.forest = forest;
         // Keep expanded sets for existing branches/issues, expand new ones by default
         for b in &self.forest.branches {
@@ -578,6 +681,9 @@ impl App {
             }
         }
         self.rebuild_flat();
+        // Rebuild issues data (every local issue grouped)
+        let issues_data = build_issues_data(issues, links, &self.snapshot);
+        self.replace_issues_data(issues_data);
         self.last_herdr = Instant::now();
     }
 
@@ -630,6 +736,8 @@ pub fn draw_view_tabs(view: View, area: Rect, buf: &mut Buffer) {
         Span::styled("[1 Forest]", tab_style(view == View::Forest)),
         Span::raw(" "),
         Span::styled("[2 Map]", tab_style(view == View::Map)),
+        Span::raw(" "),
+        Span::styled("[3 Issues]", tab_style(view == View::Issues)),
     ]);
     buf.set_line(area.x + 2, area.y, &line, area.width.saturating_sub(2));
 }
@@ -638,6 +746,7 @@ pub fn draw_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
     let view_label = match app.view {
         View::Forest => " Forest ",
         View::Map => " Map ",
+        View::Issues => " Issues ",
     };
     let mut spans = vec![
         Span::styled(
@@ -647,7 +756,7 @@ pub fn draw_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            " q:quit  r:refresh  ?:help  1:Forest  2:Map  Enter:details  ↑/↓:navigate  ←/→:collapse/expand",
+            " q:quit  r:refresh  ?:help  1:Forest  2:Map  3:Issues  Enter:details  ↑/↓:navigate  ←/→:collapse/expand",
         ),
     ];
     if app.stale_herdr {
@@ -801,6 +910,66 @@ pub fn draw_map_detail(app: &App, area: Rect, buf: &mut Buffer) {
         .render(inner, buf);
 }
 
+pub fn draw_issues_detail(app: &App, area: Rect, buf: &mut Buffer) {
+    let row = match app.current_issue() {
+        Some(row) => row,
+        None => return,
+    };
+    let mut body = format!("State: {}\n", row.state);
+    if !row
+        .issue
+        .extra
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .is_none()
+    {
+        let labels = row
+            .issue
+            .extra
+            .get("labels")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>();
+        if !labels.is_empty() {
+            body.push_str(&format!("Labels: {}\n", labels.join(", ")));
+        }
+    }
+    body.push_str(&format!("Status: {}\n", row.issue.status));
+    if row.linked {
+        body.push_str("Linked: yes\n");
+    }
+    if let Some(agent) = &row.agent {
+        body.push_str(&format!("Agent: {} {}\n", agent.agent.agent, agent.badge));
+    }
+    if !row.blockers.is_empty() {
+        body.push_str(&format!(
+            "Open blockers: {}\n",
+            row.blockers
+                .iter()
+                .map(|id| id.to_string().chars().take(8).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    body.push_str(&format!("\n{}\n", render_markdown_to_text(&row.issue.body)));
+    let block = Block::default()
+        .title(format!("Issue: {}", row.issue.title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    Clear.render(inner, buf);
+    let max_scroll = wrapped_line_count(&body, inner.width)
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .scroll((app.issues_detail_scroll.min(max_scroll), 0))
+        .render(inner, buf);
+}
+
 fn wrapped_line_count(text: &str, width: u16) -> usize {
     if width == 0 {
         return 0;
@@ -820,6 +989,7 @@ Copse — terminal board
 Views:
   1          Forest (branch → issue → agent)
   2, m       Map (Wayfinder frontiers)
+  3, i       Issues (every local issue grouped)
   Tab        Next Wayfinder map
 
 Navigation:
@@ -927,6 +1097,31 @@ pub async fn run(cwd: PathBuf) -> Result<()> {
                                 selected: Some(app.selected),
                                 expanded_branches: Some(&app.expanded_branches),
                                 expanded_issues: Some(&app.expanded_issues),
+                            }
+                            .render(content_area, f.buffer_mut());
+                        }
+                    }
+                    View::Issues => {
+                        if app.show_detail {
+                            let cols = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([
+                                    Constraint::Percentage(60),
+                                    Constraint::Percentage(40),
+                                ])
+                                .split(content_area);
+                            let list_area = cols[0];
+                            let detail_area = cols[1];
+                            IssuesWidget {
+                                data: &app.issues_data,
+                                selected: Some(app.selected_issue),
+                            }
+                            .render(list_area, f.buffer_mut());
+                            draw_issues_detail(&app, detail_area, f.buffer_mut());
+                        } else {
+                            IssuesWidget {
+                                data: &app.issues_data,
+                                selected: Some(app.selected_issue),
                             }
                             .render(content_area, f.buffer_mut());
                         }

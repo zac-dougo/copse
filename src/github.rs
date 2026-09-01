@@ -55,7 +55,7 @@ pub struct GitHubIssue {
     pub open_blockers: Vec<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrontierState {
     Frontier,
     Blocked,

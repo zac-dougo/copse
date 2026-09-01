@@ -3,6 +3,7 @@ mod discovery;
 mod forest;
 mod github;
 mod herdr;
+mod issues;
 mod map;
 mod tracker;
 
