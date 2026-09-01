@@ -67,6 +67,43 @@ pub fn branch_is_main(branch: &Option<String>) -> bool {
     }
 }
 
+fn parse_blocked_by(body: &str) -> Vec<Uuid> {
+    body.lines()
+        .take(12)
+        .filter_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower
+                .find("blocked by:")
+                .map(|index| &line[index + "blocked by:".len()..])
+        })
+        .flat_map(|value| value.split(|ch: char| ch == ',' || ch.is_whitespace()))
+        .filter_map(|part| {
+            Uuid::parse_str(part.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-')).ok()
+        })
+        .collect()
+}
+
+fn has_map_label(issue: &Issue) -> bool {
+    issue
+        .extra
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .any(|l| l == "wayfinder:map" || l == "spec")
+}
+
+fn parse_parent_id(body: &str) -> Option<Uuid> {
+    body.lines().take(12).find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        let value = lower.find("parent:").map(|idx| &line[idx + "parent:".len()..])?;
+        value.split_whitespace().find_map(|part| {
+            Uuid::parse_str(part.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-')).ok()
+        })
+    })
+}
+
 pub fn build_forest(
     worktrees: Vec<Worktree>,
     issues: Vec<Issue>,
@@ -216,14 +253,37 @@ pub fn build_forest(
         });
     }
 
+    // Build map set for frontier-derivation: only children of maps that are frontier
+    let map_ids: HashSet<Uuid> = issue_by_id.values().filter(|i| has_map_label(i)).map(|i| i.id).collect();
+
     let mut unlinked_issues = Vec::new();
     for issue in issues {
-        if !linked_issue_ids.contains(&issue.id) {
-            unlinked_issues.push(IssueNode {
-                issue,
-                agents: Vec::new(),
-            });
+        if linked_issue_ids.contains(&issue.id) {
+            continue;
         }
+        if issue.status != Status::Open {
+            continue;
+        }
+        let is_blocked = parse_blocked_by(&issue.body)
+            .into_iter()
+            .any(|id| issue_by_id.get(&id).is_some_and(|b| b.status != Status::Closed) || !issue_by_id.contains_key(&id));
+        if is_blocked {
+            continue;
+        }
+        // If maps exist, only keep issues that are children of a map (current frontier per map).
+        // This matches "get its issues from the current frontier in each map".
+        // When no maps exist (unit tests without parent links), fall back to open+unblocked.
+        if !map_ids.is_empty() {
+            let parent = parse_parent_id(&issue.body);
+            match parent {
+                Some(pid) if map_ids.contains(&pid) => {}
+                _ => continue,
+            }
+        }
+        unlinked_issues.push(IssueNode {
+            issue,
+            agents: Vec::new(),
+        });
     }
 
     Forest {

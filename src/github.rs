@@ -300,9 +300,7 @@ pub fn fetch_local_wayfinder_maps(issues_dir: &Path) -> Result<MapData, GitHubEr
     let mut maps = issues
         .iter()
         .filter(|issue| {
-            issue_labels(issue)
-                .iter()
-                .any(|label| label == "wayfinder:map")
+            issue_labels(issue).iter().any(|label| label == "wayfinder:map" || label == "spec")
         })
         .map(|map| {
             let children = issues
