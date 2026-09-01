@@ -745,7 +745,9 @@ pub fn draw_detail(app: &App, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
     Clear.render(inner, buf);
-    Paragraph::new(body).render(inner, buf);
+    Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
 }
 
 pub fn draw_map_detail(app: &App, area: Rect, buf: &mut Buffer) {
@@ -1287,6 +1289,49 @@ mod tests {
         assert!(rendered.contains("wrap-marker"));
         assert!(rendered.contains("actual answer"));
         assert!(rendered.contains("content."));
+    }
+
+    #[test]
+    fn forest_detail_wraps_long_body() {
+        let board = repo_with_worktrees();
+        let mut issue = sample_issue("Long Issue");
+        issue.body = "This is a very long body with a wrap-marker-forest that should wrap across multiple lines in the detail pane even though it is a single paragraph without newlines. ".repeat(2);
+        let wt = Worktree {
+            path: PathBuf::from("/tmp/repo"),
+            head: "abc".to_string(),
+            branch: Some("refs/heads/main".to_string()),
+            is_bare: false,
+            is_detached: false,
+            is_prunable: false,
+        };
+        let link = Link {
+            id: Uuid::new_v4(),
+            issue: issue.id,
+            worktree: "/tmp/repo".to_string(),
+            body: "".to_string(),
+            extra: HashMap::new(),
+        };
+        let forest = build_forest(vec![wt], vec![issue], vec![link], &Snapshot::default());
+        let mut app = App::new_for_test(board, forest, Snapshot::default());
+        // flat: 0 branch, 1 issue, 2 agent placeholder - select issue
+        app.selected = 1;
+        let area = Rect::new(0, 0, 32, 12);
+        let mut buf = Buffer::empty(area);
+        draw_detail(&app, area, &mut buf);
+        let rendered: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("wrap-marker-forest"),
+            "long body should be rendered with wrapping: {rendered}"
+        );
+        // Ensure it wrapped - the marker should not be truncated and body should use multiple lines
+        assert!(rendered.lines().count() > 3);
     }
 
     #[test]
