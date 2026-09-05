@@ -18,11 +18,13 @@ use uuid::Uuid;
 
 use crate::discovery::{BoardRepository, discover};
 use crate::forest::{Forest, ForestWidget, build_forest, render_markdown_to_text};
-use crate::github::{MapData, default_map_index, fetch_wayfinder_maps, map_index_for_number};
+use crate::github::{
+    GitHubIssue, MapData, default_map_index, fetch_github_board, map_index_for_number,
+};
 use crate::herdr::{Snapshot, fetch_snapshot_blocking};
 use crate::issues::{IssuesData, IssuesWidget, build_issues_data};
 use crate::map::MapWidget;
-use crate::tracker::{load_issues, load_links};
+use crate::tracker::{Link, load_links};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectedKind {
@@ -53,13 +55,12 @@ pub struct App {
     pub forest: Forest,
     pub snapshot: Snapshot,
     pub stale_herdr: bool,
-    pub stale_local: bool,
     pub last_herdr: Instant,
     pub last_github: Instant,
     pub selected: usize,
     pub flat_nodes: Vec<FlatNode>,
     pub expanded_branches: HashSet<PathBuf>,
-    pub expanded_issues: HashSet<Uuid>,
+    pub expanded_issues: HashSet<u64>,
     pub show_help: bool,
     pub show_detail: bool,
     pub status_msg: String,
@@ -69,6 +70,7 @@ pub struct App {
     pub selected_map_child: usize,
     pub map_detail_scroll: u16,
     pub stale_github: bool,
+    pub github_issues: Vec<GitHubIssue>,
     pub issues_data: IssuesData,
     pub selected_issue: usize,
     pub issues_detail_scroll: u16,
@@ -77,32 +79,34 @@ pub struct App {
 impl App {
     pub fn new(cwd: PathBuf) -> Result<Self> {
         let board = discover(&cwd)?;
-        let issues = load_issues(&board.issues_dir).unwrap_or_default();
         let links = load_links(&board.links_dir).unwrap_or_default();
         let snapshot = fetch_snapshot_blocking().unwrap_or_default();
-        let forest = build_forest(board.worktrees.clone(), issues, links, &snapshot);
-        let (map_data, stale_github) = match fetch_wayfinder_maps(&cwd, &board.issues_dir) {
-            Ok(result) => result,
-            Err(_) => (MapData::new(), true),
+        // Issues live on GitHub. If the fetch fails, start with empty boards
+        // and mark GitHub stale; the next 30s refresh retries.
+        let (github_issues, map_data, stale_github) = match fetch_github_board(&cwd) {
+            Ok(github) => (github.issues, github.maps, false),
+            Err(_) => (Vec::new(), MapData::new(), true),
         };
+        let forest = build_forest(
+            board.worktrees.clone(),
+            github_issues.clone(),
+            links.clone(),
+            &snapshot,
+        );
         let selected_map = default_map_index(&map_data).unwrap_or(0);
 
         let mut expanded_branches: HashSet<PathBuf> = HashSet::new();
         for b in &forest.branches {
             expanded_branches.insert(b.worktree.path.clone());
         }
-        let mut expanded_issues: HashSet<Uuid> = HashSet::new();
+        let mut expanded_issues: HashSet<u64> = HashSet::new();
         for b in &forest.branches {
             if let Some(issue) = &b.issue {
-                expanded_issues.insert(issue.issue.id);
+                expanded_issues.insert(issue.issue.number);
             }
         }
 
-        let issues_data = build_issues_data(
-            load_issues(&board.issues_dir).unwrap_or_default(),
-            load_links(&board.links_dir).unwrap_or_default(),
-            &snapshot,
-        );
+        let issues_data = build_issues_data(github_issues.clone(), links, &snapshot);
 
         let mut app = Self {
             cwd,
@@ -110,7 +114,6 @@ impl App {
             forest,
             snapshot,
             stale_herdr: false,
-            stale_local: false,
             last_herdr: Instant::now(),
             last_github: Instant::now(),
             selected: 0,
@@ -126,6 +129,7 @@ impl App {
             selected_map_child: 0,
             map_detail_scroll: 0,
             stale_github,
+            github_issues,
             issues_data,
             selected_issue: 0,
             issues_detail_scroll: 0,
@@ -141,10 +145,10 @@ impl App {
         for b in &forest.branches {
             expanded_branches.insert(b.worktree.path.clone());
         }
-        let mut expanded_issues: HashSet<Uuid> = HashSet::new();
+        let mut expanded_issues: HashSet<u64> = HashSet::new();
         for b in &forest.branches {
             if let Some(issue) = &b.issue {
-                expanded_issues.insert(issue.issue.id);
+                expanded_issues.insert(issue.issue.number);
             }
         }
         let mut app = Self {
@@ -153,7 +157,6 @@ impl App {
             forest,
             snapshot,
             stale_herdr: false,
-            stale_local: false,
             last_herdr: Instant::now(),
             last_github: Instant::now(),
             selected: 0,
@@ -169,6 +172,7 @@ impl App {
             selected_map_child: 0,
             map_detail_scroll: 0,
             stale_github: false,
+            github_issues: Vec::new(),
             issues_data: IssuesData::default(),
             selected_issue: 0,
             issues_detail_scroll: 0,
@@ -200,7 +204,7 @@ impl App {
                     agent_idx: None,
                     display: issue.issue.title.clone(),
                 });
-                if !self.expanded_issues.contains(&issue.issue.id) {
+                if !self.expanded_issues.contains(&issue.issue.number) {
                     continue;
                 }
                 for (a_idx, agent) in issue.agents.iter().enumerate() {
@@ -326,17 +330,38 @@ impl App {
     }
 
     fn replace_issues_data(&mut self, data: IssuesData) {
-        let selected_id = self.current_issue().map(|row| row.issue.id);
+        let selected_number = self.current_issue().map(|row| row.issue.number);
         self.issues_data = data;
-        self.selected_issue = selected_id
-            .and_then(|id| {
+        self.selected_issue = selected_number
+            .and_then(|number| {
                 self.issues_data
                     .ordered()
                     .iter()
-                    .position(|row| row.issue.id == id)
+                    .position(|row| row.issue.number == number)
             })
             .unwrap_or_else(|| self.first_issue());
         self.issues_detail_scroll = 0;
+    }
+
+    /// Rebuild Forest and Issues from GitHub issues plus local links.
+    fn rebuild_boards(&mut self, issues: Vec<GitHubIssue>, links: Vec<Link>) {
+        let forest = build_forest(
+            self.board.worktrees.clone(),
+            issues.clone(),
+            links.clone(),
+            &self.snapshot,
+        );
+        self.forest = forest;
+        // Keep expanded sets for existing branches/issues, expand new ones by default
+        for b in &self.forest.branches {
+            self.expanded_branches.insert(b.worktree.path.clone());
+            if let Some(issue) = &b.issue {
+                self.expanded_issues.insert(issue.issue.number);
+            }
+        }
+        self.rebuild_flat();
+        let issues_data = build_issues_data(issues, links, &self.snapshot);
+        self.replace_issues_data(issues_data);
     }
 
     fn next_map(&mut self) {
@@ -388,23 +413,23 @@ impl App {
                     self.rebuild_flat();
                 }
                 SelectedKind::Issue => {
-                    // Find issue id
-                    let issue_id = if node.branch_idx == usize::MAX {
+                    // Find issue number
+                    let issue_number = if node.branch_idx == usize::MAX {
                         self.forest.unlinked_issues[node.issue_idx.unwrap()]
                             .issue
-                            .id
+                            .number
                     } else {
                         self.forest.branches[node.branch_idx]
                             .issue
                             .as_ref()
                             .unwrap()
                             .issue
-                            .id
+                            .number
                     };
-                    if self.expanded_issues.contains(&issue_id) {
-                        self.expanded_issues.remove(&issue_id);
+                    if self.expanded_issues.contains(&issue_number) {
+                        self.expanded_issues.remove(&issue_number);
                     } else {
-                        self.expanded_issues.insert(issue_id);
+                        self.expanded_issues.insert(issue_number);
                     }
                     self.rebuild_flat();
                 }
@@ -505,20 +530,20 @@ impl App {
                         }
                         SelectedKind::Issue => {
                             // Collapse if expanded, else move to branch
-                            let issue_id = if node.branch_idx == usize::MAX {
+                            let issue_number = if node.branch_idx == usize::MAX {
                                 self.forest.unlinked_issues[node.issue_idx.unwrap()]
                                     .issue
-                                    .id
+                                    .number
                             } else {
                                 self.forest.branches[node.branch_idx]
                                     .issue
                                     .as_ref()
                                     .unwrap()
                                     .issue
-                                    .id
+                                    .number
                             };
-                            if self.expanded_issues.contains(&issue_id) {
-                                self.expanded_issues.remove(&issue_id);
+                            if self.expanded_issues.contains(&issue_number) {
+                                self.expanded_issues.remove(&issue_number);
                                 self.rebuild_flat();
                             } else if node.branch_idx != usize::MAX {
                                 // Move to parent branch
@@ -557,20 +582,20 @@ impl App {
                             }
                         }
                         SelectedKind::Issue => {
-                            let issue_id = if node.branch_idx == usize::MAX {
+                            let issue_number = if node.branch_idx == usize::MAX {
                                 self.forest.unlinked_issues[node.issue_idx.unwrap()]
                                     .issue
-                                    .id
+                                    .number
                             } else {
                                 self.forest.branches[node.branch_idx]
                                     .issue
                                     .as_ref()
                                     .unwrap()
                                     .issue
-                                    .id
+                                    .number
                             };
-                            if !self.expanded_issues.contains(&issue_id) {
-                                self.expanded_issues.insert(issue_id);
+                            if !self.expanded_issues.contains(&issue_number) {
+                                self.expanded_issues.insert(issue_number);
                                 self.rebuild_flat();
                             } else {
                                 // Move to first agent if any
@@ -635,25 +660,14 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
-        // Reload local data and Herdr snapshot.
-        // Keep last good on failure.
-        let mut local_ok = true;
-        let issues = load_issues(&self.board.issues_dir).unwrap_or_else(|_| {
-            local_ok = false;
-            Vec::new()
-        });
-        let links = load_links(&self.board.links_dir).unwrap_or_else(|_| {
-            local_ok = false;
-            Vec::new()
-        });
+        // Reload worktrees, links, and Herdr snapshot. GitHub issues are cached
+        // from the last successful fetch; the 30s GitHub tick refreshes them.
+        let links = load_links(&self.board.links_dir).unwrap_or_default();
 
         // Refresh board discovery for worktrees (in case a new worktree was added).
         if let Ok(new_board) = discover(&self.cwd) {
             self.board = new_board;
-        } else {
-            local_ok = false;
         }
-        self.stale_local = !local_ok;
 
         match fetch_snapshot_blocking() {
             Ok(snap) => {
@@ -666,33 +680,20 @@ impl App {
             }
         }
 
-        let forest = build_forest(
-            self.board.worktrees.clone(),
-            issues.clone(),
-            links.clone(),
-            &self.snapshot,
-        );
-        self.forest = forest;
-        // Keep expanded sets for existing branches/issues, expand new ones by default
-        for b in &self.forest.branches {
-            self.expanded_branches.insert(b.worktree.path.clone());
-            if let Some(issue) = &b.issue {
-                self.expanded_issues.insert(issue.issue.id);
-            }
-        }
-        self.rebuild_flat();
-        // Rebuild issues data (every local issue grouped)
-        let issues_data = build_issues_data(issues, links, &self.snapshot);
-        self.replace_issues_data(issues_data);
+        let issues = self.github_issues.clone();
+        self.rebuild_boards(issues, links);
         self.last_herdr = Instant::now();
     }
 
     pub fn refresh_github(&mut self) {
         self.last_github = Instant::now();
-        match fetch_wayfinder_maps(&self.cwd, &self.board.issues_dir) {
-            Ok((map_data, stale_github)) => {
-                self.replace_map_data(map_data);
-                self.stale_github = stale_github;
+        match fetch_github_board(&self.cwd) {
+            Ok(github) => {
+                self.github_issues = github.issues.clone();
+                self.replace_map_data(github.maps);
+                let links = load_links(&self.board.links_dir).unwrap_or_default();
+                self.rebuild_boards(github.issues, links);
+                self.stale_github = false;
             }
             Err(_) => {
                 self.stale_github = true;
@@ -765,12 +766,6 @@ pub fn draw_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
             Style::default().fg(Color::Yellow),
         ));
     }
-    if app.stale_local {
-        spans.push(Span::styled(
-            "  ● local stale",
-            Style::default().fg(Color::Yellow),
-        ));
-    }
     if app.stale_github {
         spans.push(Span::styled(
             "  ● GitHub stale",
@@ -815,10 +810,10 @@ pub fn draw_detail(app: &App, area: Rect, buf: &mut Buffer) {
                     .unwrap()
                     .issue
             };
-            let title = format!("Issue: {}", issue.title);
+            let title = format!("Issue #{}: {}", issue.number, issue.title);
             let body = format!(
-                "Status: {}\n\n{}",
-                issue.status,
+                "State: {}\n\n{}",
+                issue.state,
                 render_markdown_to_text(&issue.body)
             );
             (title, body)
@@ -916,46 +911,32 @@ pub fn draw_issues_detail(app: &App, area: Rect, buf: &mut Buffer) {
         None => return,
     };
     let mut body = format!("State: {}\n", row.state);
-    if !row
-        .issue
-        .extra
-        .get("labels")
-        .and_then(|v| v.as_array())
-        .is_none()
-    {
-        let labels = row
-            .issue
-            .extra
-            .get("labels")
-            .and_then(toml::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(toml::Value::as_str)
-            .collect::<Vec<_>>();
-        if !labels.is_empty() {
-            body.push_str(&format!("Labels: {}\n", labels.join(", ")));
-        }
+    if !row.issue.labels.is_empty() {
+        body.push_str(&format!("Labels: {}\n", row.issue.labels.join(", ")));
     }
-    body.push_str(&format!("Status: {}\n", row.issue.status));
+    if !row.issue.assignees.is_empty() {
+        body.push_str(&format!("Assignees: {}\n", row.issue.assignees.join(", ")));
+    }
     if row.linked {
         body.push_str("Linked: yes\n");
     }
     if let Some(agent) = &row.agent {
         body.push_str(&format!("Agent: {} {}\n", agent.agent.agent, agent.badge));
     }
-    if !row.blockers.is_empty() {
+    if !row.issue.open_blockers.is_empty() {
         body.push_str(&format!(
             "Open blockers: {}\n",
-            row.blockers
+            row.issue
+                .open_blockers
                 .iter()
-                .map(|id| id.to_string().chars().take(8).collect::<String>())
+                .map(|number| format!("#{number}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
     }
     body.push_str(&format!("\n{}\n", render_markdown_to_text(&row.issue.body)));
     let block = Block::default()
-        .title(format!("Issue: {}", row.issue.title))
+        .title(format!("Issue #{}: {}", row.issue.number, row.issue.title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -989,7 +970,7 @@ Copse — terminal board
 Views:
   1          Forest (branch → issue → agent)
   2, m       Map (Wayfinder frontiers)
-  3, i       Issues (every local issue grouped)
+  3, i       Issues (every GitHub issue grouped)
   Tab        Next Wayfinder map
 
 Navigation:
@@ -1015,7 +996,7 @@ Statuses:
   · unknown  gray
 
 Refresh:
-  Herdr + local Git/.copse every 2s
+  Worktrees + links + Herdr every 2s
   GitHub Issues + Wayfinder every 30s
   r forces immediate refresh
 
@@ -1254,8 +1235,7 @@ mod tests {
         FrontierState, GitHubComment, GitHubIssue, IssueState, WayfinderChild, WayfinderMap,
     };
     use crate::herdr::{AgentStatus, Snapshot};
-    use crate::tracker::{Issue, Link, Status};
-    use std::collections::HashMap;
+    use crate::tracker::Link;
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -1281,19 +1261,21 @@ mod tests {
             current_worktree_path: PathBuf::from("/tmp/repo"),
             worktrees: vec![wt1, wt2],
             copse_dir: PathBuf::from("/tmp/repo/.copse"),
-            issues_dir: PathBuf::from("/tmp/repo/.copse/issues"),
             links_dir: PathBuf::from("/tmp/repo/.copse/links"),
             is_copse_present: false,
         }
     }
 
-    fn sample_issue(title: &str) -> Issue {
-        Issue {
-            id: Uuid::new_v4(),
+    fn sample_issue(number: u64, title: &str) -> GitHubIssue {
+        GitHubIssue {
+            number,
             title: title.to_string(),
-            status: Status::Open,
+            state: IssueState::Open,
             body: "body".to_string(),
-            extra: HashMap::new(),
+            comments: Vec::new(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            open_blockers: Vec::new(),
         }
     }
 
@@ -1322,10 +1304,10 @@ mod tests {
             is_detached: false,
             is_prunable: false,
         }];
-        let issue = sample_issue("Issue");
+        let issue = sample_issue(7, "Issue");
         let link = Link {
             id: Uuid::new_v4(),
-            issue: issue.id,
+            issue: issue.number,
             worktree: "/tmp/repo".to_string(),
             body: "".to_string(),
             extra: HashMap::new(),
@@ -1337,7 +1319,6 @@ mod tests {
             current_worktree_path: PathBuf::from("/tmp/repo"),
             worktrees: wts.clone(),
             copse_dir: PathBuf::from("/tmp/repo/.copse"),
-            issues_dir: PathBuf::from("/tmp/repo/.copse/issues"),
             links_dir: PathBuf::from("/tmp/repo/.copse/links"),
             is_copse_present: false,
         };
@@ -1489,7 +1470,7 @@ mod tests {
     #[test]
     fn forest_detail_wraps_long_body() {
         let board = repo_with_worktrees();
-        let mut issue = sample_issue("Long Issue");
+        let mut issue = sample_issue(9, "Long Issue");
         issue.body = "This is a very long body with a wrap-marker-forest that should wrap across multiple lines in the detail pane even though it is a single paragraph without newlines. ".repeat(2);
         let wt = Worktree {
             path: PathBuf::from("/tmp/repo"),
@@ -1501,7 +1482,7 @@ mod tests {
         };
         let link = Link {
             id: Uuid::new_v4(),
-            issue: issue.id,
+            issue: issue.number,
             worktree: "/tmp/repo".to_string(),
             body: "".to_string(),
             extra: HashMap::new(),
@@ -1562,16 +1543,20 @@ mod tests {
     }
 
     #[test]
-    fn refresh_keeps_last_good_on_failure() {
-        // Just test that refresh doesn't panic when .copse is missing and Herdr is missing.
+    fn refresh_rebuilds_from_cached_github_issues() {
+        // Refresh must not panic when .copse links and Herdr are missing, and
+        // must rebuild the forest from cached GitHub issues plus worktrees.
         let board = repo_with_worktrees();
         let forest = Forest::default();
         let snap = Snapshot::default();
         let mut app = App::new_for_test(board, forest, snap);
-        // This will try to load from /tmp paths which don't have herdr, but should not panic
+        app.github_issues = vec![sample_issue(7, "Cached")];
         app.refresh();
-        // Should have updated forest (still empty or with available).
-        assert!(app.forest.branches.len() < 1000);
-        assert!(app.stale_local);
+        // Two worktrees from the board, none linked (no link files on disk).
+        assert_eq!(app.forest.branches.len(), 2);
+        assert!(app.forest.branches.iter().all(|b| b.issue.is_none()));
+        // The cached issue shows up as unlinked: open, unblocked, no map label.
+        assert_eq!(app.forest.unlinked_issues.len(), 1);
+        assert_eq!(app.issues_data.len(), 1);
     }
 }

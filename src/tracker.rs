@@ -8,24 +8,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Open,
-    Closed,
-    Archived,
-}
-
-impl std::fmt::Display for Status {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Status::Open => write!(f, "open"),
-            Status::Closed => write!(f, "closed"),
-            Status::Archived => write!(f, "archived"),
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("missing front matter delimiter")]
@@ -36,8 +18,10 @@ pub enum StoreError {
     InvalidTomlSer(#[from] toml::ser::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("invalid status: {0}")]
-    InvalidStatus(String),
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+    #[error("invalid issue number for {field}: {value}")]
+    InvalidIssueNumber { field: &'static str, value: String },
     #[error("invalid UUID for {field}: {source}")]
     InvalidUuid {
         field: &'static str,
@@ -49,38 +33,25 @@ pub enum StoreError {
     RefusingOverwrite { path: String, reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Issue {
-    pub id: Uuid,
-    pub title: String,
-    pub status: Status,
-    pub body: String,
-    pub extra: HashMap<String, toml::Value>,
-}
-
+/// An explicit association between a worktree and a GitHub issue.
+///
+/// Issues themselves live on GitHub. The link only records which issue number
+/// a worktree is working on. `id` is a local UUID that names the file;
+/// `issue` is the GitHub issue number.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Link {
     pub id: Uuid,
-    pub issue: Uuid,
+    pub issue: u64,
     pub worktree: String,
     pub body: String,
     pub extra: HashMap<String, toml::Value>,
 }
 
-// Internal front matter structs for serde
-#[derive(Debug, Serialize, Deserialize)]
-struct IssueFrontMatter {
-    id: String,
-    title: String,
-    status: String,
-    #[serde(flatten)]
-    extra: HashMap<String, toml::Value>,
-}
-
+// Internal front matter struct for serde
 #[derive(Debug, Serialize, Deserialize)]
 struct LinkFrontMatter {
     id: String,
-    issue: String,
+    issue: u64,
     worktree: String,
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
@@ -126,76 +97,64 @@ fn split_front_matter(content: &str) -> Result<(&str, &str), StoreError> {
     }
 }
 
-fn parse_status(s: &str) -> Result<Status, StoreError> {
-    match s {
-        "open" => Ok(Status::Open),
-        "closed" => Ok(Status::Closed),
-        "archived" => Ok(Status::Archived),
-        other => Err(StoreError::InvalidStatus(other.to_string())),
+fn parse_issue_number(value: &toml::Value) -> Result<u64, StoreError> {
+    match value {
+        toml::Value::Integer(n) if *n >= 0 => Ok(*n as u64),
+        // A quoted number is still a number.
+        toml::Value::String(s) => s
+            .parse::<u64>()
+            .map_err(|_| StoreError::InvalidIssueNumber {
+                field: "issue",
+                value: s.clone(),
+            }),
+        other => Err(StoreError::InvalidIssueNumber {
+            field: "issue",
+            value: other.to_string(),
+        }),
     }
 }
 
-// Public parsing from string, used by tests and file loading
-pub fn parse_issue_str(content: &str) -> Result<Issue, StoreError> {
-    let (front_str, body) = split_front_matter(content)?;
-    let fm: IssueFrontMatter = toml::from_str(front_str).map_err(StoreError::InvalidToml)?;
-    let id = Uuid::parse_str(&fm.id).map_err(|e| StoreError::InvalidUuid {
-        field: "id",
-        source: e,
-    })?;
-    let status = parse_status(&fm.status)?;
-    Ok(Issue {
-        id,
-        title: fm.title,
-        status,
-        body: body.to_string(),
-        extra: fm.extra,
-    })
-}
-
+// Public parsing from string, used by tests and file loading.
+// Accepts both `issue = 123` and `issue = "123"`; rejects UUID-era links
+// (`issue = "<uuid>"`) so stale local-tracker links fail loudly instead of
+// silently pointing nowhere.
 pub fn parse_link_str(content: &str) -> Result<Link, StoreError> {
     let (front_str, body) = split_front_matter(content)?;
-    let fm: LinkFrontMatter = toml::from_str(front_str).map_err(StoreError::InvalidToml)?;
-    let id = Uuid::parse_str(&fm.id).map_err(|e| StoreError::InvalidUuid {
+    let table: toml::Table = toml::from_str(front_str).map_err(StoreError::InvalidToml)?;
+    let mut table = table;
+    let id_str = table
+        .remove("id")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .ok_or(StoreError::MissingField("id"))?;
+    let id = Uuid::parse_str(&id_str).map_err(|e| StoreError::InvalidUuid {
         field: "id",
         source: e,
     })?;
-    let issue = Uuid::parse_str(&fm.issue).map_err(|e| StoreError::InvalidUuid {
-        field: "issue",
-        source: e,
-    })?;
+    let issue_value = table
+        .remove("issue")
+        .ok_or_else(|| StoreError::InvalidIssueNumber {
+            field: "issue",
+            value: String::from("(missing)"),
+        })?;
+    let issue = parse_issue_number(&issue_value)?;
+    let worktree = table
+        .remove("worktree")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let extra: HashMap<String, toml::Value> = table.into_iter().collect();
     Ok(Link {
         id,
         issue,
-        worktree: fm.worktree,
+        worktree,
         body: body.to_string(),
-        extra: fm.extra,
+        extra,
     })
-}
-
-pub fn format_issue(issue: &Issue) -> Result<String, StoreError> {
-    let fm = IssueFrontMatter {
-        id: issue.id.to_string(),
-        title: issue.title.clone(),
-        status: issue.status.to_string(),
-        extra: issue.extra.clone(),
-    };
-    let toml_str = toml::to_string(&fm)?;
-    let mut out = String::new();
-    out.push_str("+++\n");
-    out.push_str(&toml_str);
-    out.push_str("+++\n");
-    out.push_str(&issue.body);
-    if !issue.body.is_empty() && !issue.body.ends_with('\n') {
-        out.push('\n');
-    }
-    Ok(out)
 }
 
 pub fn format_link(link: &Link) -> Result<String, StoreError> {
     let fm = LinkFrontMatter {
         id: link.id.to_string(),
-        issue: link.issue.to_string(),
+        issue: link.issue,
         worktree: link.worktree.clone(),
         extra: link.extra.clone(),
     };
@@ -213,22 +172,6 @@ pub fn format_link(link: &Link) -> Result<String, StoreError> {
 
 // File I/O with validation
 
-pub fn read_issue_file(path: &Path) -> Result<Issue, StoreError> {
-    let content = fs::read_to_string(path)?;
-    let issue = parse_issue_str(&content)?;
-    // Validate filename matches id if file stem looks like UUID
-    if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-        && let Ok(file_uuid) = Uuid::parse_str(stem)
-        && file_uuid != issue.id
-    {
-        return Err(StoreError::IdMismatch {
-            file_stem: stem.to_string(),
-            id: issue.id.to_string(),
-        });
-    }
-    Ok(issue)
-}
-
 pub fn read_link_file(path: &Path) -> Result<Link, StoreError> {
     let content = fs::read_to_string(path)?;
     let link = parse_link_str(&content)?;
@@ -242,29 +185,6 @@ pub fn read_link_file(path: &Path) -> Result<Link, StoreError> {
         });
     }
     Ok(link)
-}
-
-pub fn write_issue_file(issue: &Issue, dir: &Path) -> Result<PathBuf, StoreError> {
-    fs::create_dir_all(dir)?;
-    let path = dir.join(format!("{}.md", issue.id));
-    // If file exists, check it is not malformed before overwriting.
-    // We allow overwrite only if existing file is valid or does not exist.
-    // If existing file is malformed, refuse.
-    if path.exists() {
-        let existing = fs::read_to_string(&path)?;
-        if let Err(e) = parse_issue_str(&existing) {
-            return Err(StoreError::RefusingOverwrite {
-                path: path.display().to_string(),
-                reason: e.to_string(),
-            });
-        }
-    }
-    let content = format_issue(issue)?;
-    // Atomic write: write to temp then rename
-    let tmp = dir.join(format!(".{}.tmp", issue.id));
-    fs::write(&tmp, content)?;
-    fs::rename(&tmp, &path)?;
-    Ok(path)
 }
 
 pub fn write_link_file(link: &Link, dir: &Path) -> Result<PathBuf, StoreError> {
@@ -286,39 +206,12 @@ pub fn write_link_file(link: &Link, dir: &Path) -> Result<PathBuf, StoreError> {
     Ok(path)
 }
 
-pub fn delete_issue_file(id: Uuid, dir: &Path) -> Result<(), StoreError> {
-    // Deletion is file-only per spec. This helper is for file-only operation or tests.
-    // It does not go through the tracker's write path.
-    let path = dir.join(format!("{}.md", id));
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
 pub fn delete_link_file(id: Uuid, dir: &Path) -> Result<(), StoreError> {
     let path = dir.join(format!("{}.md", id));
     if path.exists() {
         fs::remove_file(path)?;
     }
     Ok(())
-}
-
-pub fn load_issues(dir: &Path) -> Result<Vec<Issue>, StoreError> {
-    let mut issues = Vec::new();
-    if !dir.exists() {
-        return Ok(issues);
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-            continue;
-        }
-        let issue = read_issue_file(&path)?;
-        issues.push(issue);
-    }
-    Ok(issues)
 }
 
 pub fn load_links(dir: &Path) -> Result<Vec<Link>, StoreError> {
@@ -338,11 +231,7 @@ pub fn load_links(dir: &Path) -> Result<Vec<Link>, StoreError> {
     Ok(links)
 }
 
-// Validation helpers
-
-pub fn is_valid_issue_str(content: &str) -> bool {
-    parse_issue_str(content).is_ok()
-}
+// Validation helper
 
 pub fn is_valid_link_str(content: &str) -> bool {
     parse_link_str(content).is_ok()
@@ -353,107 +242,14 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn sample_issue() -> Issue {
-        Issue {
-            id: Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
-            title: "Improve startup time".to_string(),
-            status: Status::Open,
-            body: "Investigate why startup takes several seconds.\n".to_string(),
-            extra: HashMap::new(),
-        }
-    }
-
     fn sample_link() -> Link {
         Link {
             id: Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
-            issue: Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            issue: 42,
             worktree: "/home/zac/dev/projects/copse-worktrees/main".to_string(),
             body: "".to_string(),
             extra: HashMap::new(),
         }
-    }
-
-    #[test]
-    fn issue_round_trip() {
-        let issue = sample_issue();
-        let s = format_issue(&issue).unwrap();
-        let parsed = parse_issue_str(&s).unwrap();
-        assert_eq!(issue, parsed);
-    }
-
-    #[test]
-    fn issue_statuses() {
-        for status in [Status::Open, Status::Closed, Status::Archived] {
-            let mut issue = sample_issue();
-            issue.status = status;
-            let s = format_issue(&issue).unwrap();
-            let parsed = parse_issue_str(&s).unwrap();
-            assert_eq!(parsed.status, status);
-        }
-    }
-
-    #[test]
-    fn invalid_status_rejected() {
-        let content = "+++\n\
-id = \"11111111-1111-4111-8111-111111111111\"\n\
-title = \"Test\"\n\
-status = \"invalid\"\n\
-+++\n\
-Body\n";
-        assert!(parse_issue_str(content).is_err());
-    }
-
-    #[test]
-    fn preserves_unknown_fields() {
-        let content = "+++\n\
-id = \"11111111-1111-4111-8111-111111111111\"\n\
-title = \"Test\"\n\
-status = \"open\"\n\
-custom = \"keep me\"\n\
-number = 42\n\
-+++\n\
-Body\n";
-        let parsed = parse_issue_str(content).unwrap();
-        assert_eq!(
-            parsed.extra.get("custom").unwrap().as_str().unwrap(),
-            "keep me"
-        );
-        assert_eq!(
-            parsed.extra.get("number").unwrap().as_integer().unwrap(),
-            42
-        );
-        let formatted = format_issue(&parsed).unwrap();
-        let reparsed = parse_issue_str(&formatted).unwrap();
-        assert_eq!(reparsed.extra, parsed.extra);
-    }
-
-    #[test]
-    fn malformed_missing_front_matter() {
-        let content = "Just a body without front matter";
-        assert!(matches!(
-            parse_issue_str(content),
-            Err(StoreError::MissingFrontMatter)
-        ));
-    }
-
-    #[test]
-    fn malformed_invalid_toml() {
-        let content = "+++\n\
-id = \"not-a-uuid\"\n\
-title = \"Test\"\n\
-status = \"open\"\n\
-+++\n\
-Body\n";
-        assert!(parse_issue_str(content).is_err());
-    }
-
-    #[test]
-    fn markdown_body_preserved() {
-        let mut issue = sample_issue();
-        issue.body = "# Heading\n\nSome **markdown** with `code`.\n".to_string();
-        let s = format_issue(&issue).unwrap();
-        let parsed = parse_issue_str(&s).unwrap();
-        assert_eq!(parsed.body, issue.body);
     }
 
     #[test]
@@ -465,10 +261,49 @@ Body\n";
     }
 
     #[test]
-    fn link_preserves_unknown() {
+    fn link_accepts_quoted_number() {
+        let content = "+++\n\
+id = \"22222222-2222-4222-8222-222222222222\"\n\
+issue = \"42\"\n\
+worktree = \"/tmp/worktree\"\n\
++++\n\
+";
+        let parsed = parse_link_str(content).unwrap();
+        assert_eq!(parsed.issue, 42);
+    }
+
+    #[test]
+    fn link_rejects_uuid_era_issue() {
+        // Links from the local-tracker era pointed at UUIDs. They must fail
+        // loudly so nobody silently works against a dead link.
         let content = "+++\n\
 id = \"22222222-2222-4222-8222-222222222222\"\n\
 issue = \"11111111-1111-4111-8111-111111111111\"\n\
+worktree = \"/tmp/worktree\"\n\
++++\n\
+";
+        assert!(matches!(
+            parse_link_str(content),
+            Err(StoreError::InvalidIssueNumber { .. })
+        ));
+    }
+
+    #[test]
+    fn link_rejects_negative_issue() {
+        let content = "+++\n\
+id = \"22222222-2222-4222-8222-222222222222\"\n\
+issue = -1\n\
+worktree = \"/tmp/worktree\"\n\
++++\n\
+";
+        assert!(parse_link_str(content).is_err());
+    }
+
+    #[test]
+    fn link_preserves_unknown() {
+        let content = "+++\n\
+id = \"22222222-2222-4222-8222-222222222222\"\n\
+issue = 42\n\
 worktree = \"/tmp/worktree\"\n\
 extra = \"value\"\n\
 +++\n\
@@ -489,14 +324,14 @@ extra = \"value\"\n\
         let id = Uuid::new_v4();
         let path = dir.path().join(format!("{}.md", id));
         std::fs::write(&path, "not valid toml").unwrap();
-        let issue = Issue {
+        let link = Link {
             id,
-            title: "New".to_string(),
-            status: Status::Open,
-            body: "Body".to_string(),
+            issue: 7,
+            worktree: "/tmp/wt".to_string(),
+            body: "".to_string(),
             extra: HashMap::new(),
         };
-        let err = write_issue_file(&issue, dir.path()).unwrap_err();
+        let err = write_link_file(&link, dir.path()).unwrap_err();
         assert!(matches!(err, StoreError::RefusingOverwrite { .. }));
         // Original file unchanged
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not valid toml");
@@ -507,38 +342,36 @@ extra = \"value\"\n\
         let dir = tempfile::tempdir().unwrap();
         let id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
         let other_id = Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
-        let issue = Issue {
+        let link = Link {
             id: other_id,
-            title: "Test".to_string(),
-            status: Status::Open,
+            issue: 7,
+            worktree: "/tmp/wt".to_string(),
             body: "".to_string(),
             extra: HashMap::new(),
         };
-        let content = format_issue(&issue).unwrap();
+        let content = format_link(&link).unwrap();
         let path = dir.path().join(format!("{}.md", id));
         std::fs::write(&path, content).unwrap();
-        let err = read_issue_file(&path).unwrap_err();
+        let err = read_link_file(&path).unwrap_err();
         assert!(matches!(err, StoreError::IdMismatch { .. }));
     }
 
     #[test]
     fn scan_only_md_files() {
         let dir = tempfile::tempdir().unwrap();
-        let issue = sample_issue();
-        write_issue_file(&issue, dir.path()).unwrap();
-        // Add a non-md file that should be ignored
+        let link = sample_link();
+        write_link_file(&link, dir.path()).unwrap();
+        // Add non-md files that should be ignored
         std::fs::write(dir.path().join("README.txt"), "ignored").unwrap();
         std::fs::write(dir.path().join("other.md.bak"), "ignored").unwrap();
-        let issues = load_issues(dir.path()).unwrap();
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].id, issue.id);
+        let links = load_links(dir.path()).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].id, link.id);
     }
 
     #[test]
     fn empty_dir_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let issues = load_issues(dir.path()).unwrap();
-        assert!(issues.is_empty());
         let links = load_links(dir.path()).unwrap();
         assert!(links.is_empty());
     }
@@ -547,7 +380,16 @@ extra = \"value\"\n\
     fn missing_dir_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nonexistent");
-        let issues = load_issues(&missing).unwrap();
-        assert!(issues.is_empty());
+        let links = load_links(&missing).unwrap();
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn malformed_missing_front_matter() {
+        let content = "Just a body without front matter";
+        assert!(matches!(
+            parse_link_str(content),
+            Err(StoreError::MissingFrontMatter)
+        ));
     }
 }

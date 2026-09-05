@@ -4,8 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
-use crate::tracker::{Issue, Status, load_issues, load_links};
-
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -101,8 +99,14 @@ pub enum GitHubError {
     InvalidState(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("local tracker error: {0}")]
-    Local(String),
+}
+
+/// Everything Copse reads from GitHub in one refresh: every issue (for the
+/// Forest and Issues views) plus the Wayfinder maps derived from them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GithubBoard {
+    pub issues: Vec<GitHubIssue>,
+    pub maps: MapData,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,25 +209,19 @@ pub fn map_index_for_number(maps: &[WayfinderMap], selected_number: Option<u64>)
         .or_else(|| default_map_index(maps))
 }
 
-pub fn fetch_wayfinder_maps(
-    cwd: &Path,
-    local_issues_dir: &Path,
-) -> Result<(MapData, bool), GitHubError> {
-    let local_maps = fetch_local_wayfinder_maps(local_issues_dir).unwrap_or_default();
-
-    let github_maps = fetch_github_wayfinder_maps(cwd);
-    match github_maps {
-        Ok(mut maps) => {
-            let mut combined = local_maps;
-            combined.append(&mut maps);
-            Ok((combined, false))
-        }
-        Err(_error) if !local_maps.is_empty() => Ok((local_maps, true)),
-        Err(error) => Err(error),
-    }
+/// Fetch every issue once and derive both the flat issue list and the
+/// Wayfinder maps from the same snapshot, so one `gh` call serves all views.
+/// Issues come back sorted by number with open blockers resolved.
+pub fn fetch_github_board(cwd: &Path) -> Result<GithubBoard, GitHubError> {
+    let raw = fetch_raw_issues(cwd)?;
+    let records = to_records(raw)?;
+    Ok(GithubBoard {
+        issues: all_issues_with_blockers(&records),
+        maps: build_maps_from_records(&records),
+    })
 }
 
-fn fetch_github_wayfinder_maps(cwd: &Path) -> Result<MapData, GitHubError> {
+fn fetch_raw_issues(cwd: &Path) -> Result<Vec<RawIssue>, GitHubError> {
     let output = Command::new("gh")
         .current_dir(cwd)
         .args([
@@ -251,184 +249,38 @@ fn fetch_github_wayfinder_maps(cwd: &Path) -> Result<MapData, GitHubError> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_wayfinder_maps(&stdout)
+    serde_json::from_str(&stdout).map_err(GitHubError::Parse)
 }
 
-pub fn fetch_local_wayfinder_maps(issues_dir: &Path) -> Result<MapData, GitHubError> {
-    let mut issues =
-        load_issues(issues_dir).map_err(|error| GitHubError::Local(error.to_string()))?;
-    issues.sort_by_key(|issue| issue.id);
+fn to_records(raw: Vec<RawIssue>) -> Result<Vec<IssueRecord>, GitHubError> {
+    raw.into_iter().map(IssueRecord::try_from).collect()
+}
 
-    let numbers = issues
+fn all_issues_with_blockers(records: &[IssueRecord]) -> Vec<GitHubIssue> {
+    let by_number: HashMap<u64, IssueRecord> = records
         .iter()
-        .enumerate()
-        .map(|(index, issue)| (issue.id, index as u64 + 1))
-        .collect::<HashMap<_, _>>();
-    let by_id = issues
+        .cloned()
+        .map(|record| (record.issue.number, record))
+        .collect();
+    let mut issues: Vec<GitHubIssue> = records
         .iter()
-        .map(|issue| (issue.id, issue))
-        .collect::<HashMap<_, _>>();
-
-    // Links indicate a claim. For Copse, a linked open issue is Assigned (the
-    // local equivalent of GitHub assignees). Infer links_dir as sibling of
-    // issues_dir (.copse/issues -> .copse/links) which covers App's board layout
-    // and the new test layout (tmp/issues + tmp/links).
-    let linked_ids: HashSet<uuid::Uuid> = {
-        let mut set = HashSet::new();
-        if let Some(parent) = issues_dir.parent() {
-            let candidate = parent.join("links");
-            if let Ok(links) = load_links(&candidate) {
-                for link in links {
-                    set.insert(link.issue);
-                }
-            }
-        }
-        // Fallback: if issues_dir itself is the temp dir that directly contains
-        // link files (older unit test layout), also check there.
-        if set.is_empty() {
-            if let Ok(links) = load_links(issues_dir) {
-                for link in links {
-                    // Only treat as linked if the file actually parses as a link;
-                    // issue files in same dir will be ignored by load_links (parse fails) and are skipped.
-                    set.insert(link.issue);
-                }
-            }
-        }
-        set
-    };
-
-    let mut maps = issues
-        .iter()
-        .filter(|issue| {
-            issue_labels(issue).iter().any(|label| label == "wayfinder:map" || label == "spec")
+        .map(|record| {
+            let mut issue = record.issue.clone();
+            issue.open_blockers = resolve_open_blockers(record, &by_number);
+            issue
         })
-        .map(|map| {
-            let children = issues
-                .iter()
-                .filter(|issue| parse_parent_id(&issue.body) == Some(map.id))
-                .map(|child| local_child(child, &numbers, &by_id, &linked_ids))
-                .collect::<Vec<_>>();
-            WayfinderMap {
-                issue: local_issue_with_assignees(map, numbers[&map.id], Vec::new(), false),
-                open_child_count: children
-                    .iter()
-                    .filter(|child| child.issue.state == IssueState::Open)
-                    .count(),
-                children,
-            }
-        })
-        .collect::<Vec<_>>();
-    maps.sort_by_key(|map| map.issue.number);
-    Ok(maps)
-}
-
-fn local_child(
-    issue: &Issue,
-    numbers: &HashMap<uuid::Uuid, u64>,
-    by_id: &HashMap<uuid::Uuid, &Issue>,
-    linked_ids: &HashSet<uuid::Uuid>,
-) -> WayfinderChild {
-    let blockers = parse_uuid_references(&issue.body)
-        .into_iter()
-        .filter(|id| {
-            by_id
-                .get(id)
-                .map(|blocker| blocker.status != Status::Closed)
-                .unwrap_or(true)
-        })
-        .filter_map(|id| numbers.get(&id).copied())
-        .collect::<Vec<_>>();
-    let is_linked = linked_ids.contains(&issue.id);
-    let github_issue = local_issue_with_assignees(issue, numbers[&issue.id], blockers, is_linked);
-    let state = classify_issue(&github_issue);
-    WayfinderChild {
-        issue: github_issue,
-        state,
-    }
-}
-
-fn local_issue(issue: &Issue, number: u64, open_blockers: Vec<u64>) -> GitHubIssue {
-    local_issue_with_assignees(issue, number, open_blockers, false)
-}
-
-fn local_issue_with_assignees(
-    issue: &Issue,
-    number: u64,
-    open_blockers: Vec<u64>,
-    is_linked: bool,
-) -> GitHubIssue {
-    GitHubIssue {
-        number,
-        title: issue.title.clone(),
-        state: match issue.status {
-            Status::Open => IssueState::Open,
-            Status::Closed | Status::Archived => IssueState::Closed,
-        },
-        body: issue.body.clone(),
-        comments: Vec::new(),
-        labels: issue_labels(issue),
-        // For local Copse, a link is the claim signal, equivalent to GitHub assignee.
-        assignees: if is_linked {
-            vec!["linked".to_string()]
-        } else {
-            Vec::new()
-        },
-        open_blockers,
-    }
-}
-
-fn issue_labels(issue: &Issue) -> Vec<String> {
-    issue
-        .extra
-        .get("labels")
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(toml::Value::as_str)
-        .map(str::to_string)
-        .collect()
-}
-
-fn parse_parent_id(body: &str) -> Option<uuid::Uuid> {
-    body.lines().take(12).find_map(|line| {
-        let lower = line.to_ascii_lowercase();
-        let value = lower
-            .find("parent:")
-            .map(|index| &line[index + "parent:".len()..])?;
-        value.split_whitespace().find_map(|part| {
-            uuid::Uuid::parse_str(
-                part.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-'),
-            )
-            .ok()
-        })
-    })
-}
-
-fn parse_uuid_references(body: &str) -> Vec<uuid::Uuid> {
-    body.lines()
-        .take(12)
-        .filter_map(|line| {
-            let lower = line.to_ascii_lowercase();
-            lower
-                .find("blocked by:")
-                .map(|index| &line[index + "blocked by:".len()..])
-        })
-        .flat_map(|value| value.split(|ch: char| ch == ',' || ch.is_whitespace()))
-        .filter_map(|part| {
-            uuid::Uuid::parse_str(
-                part.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-'),
-            )
-            .ok()
-        })
-        .collect()
+        .collect();
+    issues.sort_by_key(|issue| issue.number);
+    issues
 }
 
 pub fn parse_wayfinder_maps(json: &str) -> Result<MapData, GitHubError> {
     let raw_issues: Vec<RawIssue> = serde_json::from_str(json)?;
-    let records = raw_issues
-        .into_iter()
-        .map(IssueRecord::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
+    let records = to_records(raw_issues)?;
+    Ok(build_maps_from_records(&records))
+}
+
+fn build_maps_from_records(records: &[IssueRecord]) -> MapData {
     let by_number: HashMap<u64, IssueRecord> = records
         .iter()
         .cloned()
@@ -443,7 +295,7 @@ pub fn parse_wayfinder_maps(json: &str) -> Result<MapData, GitHubError> {
             .iter()
             .any(|label| label == "wayfinder:map")
     }) {
-        let child_numbers = child_numbers(record, &records);
+        let child_numbers = child_numbers(record, records);
         let children = child_numbers
             .into_iter()
             .filter_map(|number| by_number.get(&number))
@@ -466,7 +318,7 @@ pub fn parse_wayfinder_maps(json: &str) -> Result<MapData, GitHubError> {
     }
 
     maps.sort_by_key(|map| map.issue.number);
-    Ok(maps)
+    maps
 }
 
 impl TryFrom<RawIssue> for IssueRecord {
@@ -990,133 +842,6 @@ mod tests {
                 .map(|child| child.issue.number)
                 .collect::<Vec<_>>(),
             vec![11, 12]
-        );
-    }
-
-    #[test]
-    fn loads_local_maps_and_uuid_relationships() {
-        let dir = tempfile::tempdir().unwrap();
-        let map_id = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
-        let blocker_id = uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
-        let child_id = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
-        let labels = |values: &[&str]| {
-            toml::Value::Array(
-                values
-                    .iter()
-                    .map(|value| toml::Value::String((*value).to_string()))
-                    .collect(),
-            )
-        };
-        for issue in [
-            Issue {
-                id: map_id,
-                title: "Local map".to_string(),
-                status: Status::Open,
-                body: String::new(),
-                extra: HashMap::from([(String::from("labels"), labels(&["wayfinder:map"]))]),
-            },
-            Issue {
-                id: blocker_id,
-                title: "Blocker".to_string(),
-                status: Status::Open,
-                body: String::new(),
-                extra: HashMap::new(),
-            },
-            Issue {
-                id: child_id,
-                title: "Child".to_string(),
-                status: Status::Open,
-                body: format!("Parent: {map_id}\nBlocked by: {blocker_id}\n"),
-                extra: HashMap::new(),
-            },
-        ] {
-            crate::tracker::write_issue_file(&issue, dir.path()).unwrap();
-        }
-
-        let maps = fetch_local_wayfinder_maps(dir.path()).unwrap();
-        assert_eq!(maps.len(), 1);
-        assert_eq!(maps[0].issue.title, "Local map");
-        assert_eq!(maps[0].children.len(), 1);
-        assert_eq!(maps[0].children[0].issue.title, "Child");
-        assert_eq!(maps[0].children[0].issue.open_blockers, vec![2]);
-        assert_eq!(maps[0].children[0].state, FrontierState::Blocked);
-    }
-
-    #[test]
-    fn local_map_linked_issue_is_assigned() {
-        // Repro for claim label bug: linked open child should be Assigned, not Frontier.
-        // Currently fetch_local_wayfinder_maps ignores .copse/links, so linked child stays Frontier.
-        let dir = tempfile::tempdir().unwrap();
-        let issues_dir = dir.path().join("issues");
-        let links_dir = dir.path().join("links");
-        std::fs::create_dir_all(&issues_dir).unwrap();
-        std::fs::create_dir_all(&links_dir).unwrap();
-        let map_id = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
-        let child_open_id = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
-        let child_linked_id =
-            uuid::Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
-        let labels = |values: &[&str]| {
-            toml::Value::Array(
-                values
-                    .iter()
-                    .map(|value| toml::Value::String((*value).to_string()))
-                    .collect(),
-            )
-        };
-        for issue in [
-            Issue {
-                id: map_id,
-                title: "Local map".to_string(),
-                status: Status::Open,
-                body: String::new(),
-                extra: HashMap::from([(String::from("labels"), labels(&["wayfinder:map"]))]),
-            },
-            Issue {
-                id: child_open_id,
-                title: "Frontier child".to_string(),
-                status: Status::Open,
-                body: format!("Parent: {map_id}\n"),
-                extra: HashMap::new(),
-            },
-            Issue {
-                id: child_linked_id,
-                title: "Linked child".to_string(),
-                status: Status::Open,
-                body: format!("Parent: {map_id}\n"),
-                extra: HashMap::new(),
-            },
-        ] {
-            crate::tracker::write_issue_file(&issue, &issues_dir).unwrap();
-        }
-        // Link the second child to main worktree, simulating a claim still on main
-        let link = crate::tracker::Link {
-            id: uuid::Uuid::new_v4(),
-            issue: child_linked_id,
-            worktree: "/tmp/repo".to_string(),
-            body: String::new(),
-            extra: HashMap::new(),
-        };
-        crate::tracker::write_link_file(&link, &links_dir).unwrap();
-
-        // Before fix: both children Frontier. After fix: linked one Assigned.
-        // Use fetch_local_wayfinder_maps_with_links if available, else fetch_local_wayfinder_maps should consider links.
-        let maps = fetch_local_wayfinder_maps(&issues_dir).unwrap();
-        // This will be red until fetch_local_wayfinder_maps checks links. Force the assertion to expose bug:
-        // We expect 2 children, one Frontier one Assigned, but current code gives 2 Frontier.
-        assert_eq!(maps.len(), 1);
-        assert_eq!(maps[0].children.len(), 2);
-        let mut states = maps[0]
-            .children
-            .iter()
-            .map(|c| (c.issue.title.clone(), c.state))
-            .collect::<Vec<_>>();
-        states.sort_by(|a, b| a.0.cmp(&b.0));
-        // Frontier child should stay Frontier, linked should be Assigned
-        assert_eq!(states[0].1, FrontierState::Frontier, "Frontier child");
-        assert_eq!(
-            states[1].1,
-            FrontierState::Assigned,
-            "Linked child should be Assigned when link exists"
         );
     }
 
