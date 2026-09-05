@@ -52,15 +52,15 @@ Copse uses Git as the source of truth, not Herdr.
 
 - Started in a nested directory: resolves to the containing worktree.
 - Started in a linked worktree: shows the same board and all worktrees. The primary worktree owns `.copse`.
-- Missing `.copse`: starts with worktrees visible but no local issues or links. The first write offers to create `.copse/issues` and `.copse/links`. Starting does not create files.
+- Missing `.copse`: starts with worktrees visible but no links. Starting does not create files.
 - Outside a Git worktree: prints an error and exits without side effects.
 
-## Local tracker
+## Worktree links
 
-Local issues and links live under the primary worktree's `.copse` directory:
+Issues live on GitHub. Copse only records which GitHub issue each worktree
+is working on, as link files under the primary worktree's `.copse` directory:
 
 ```text
-.copse/issues/<uuid>.md
 .copse/links/<uuid>.md
 ```
 
@@ -68,27 +68,17 @@ Each file is Markdown with strict TOML front matter delimited by `+++`:
 
 ```md
 +++
-id = "11111111-1111-4111-8111-111111111111"
-title = "Improve startup time"
-status = "open"
-+++
-
-Issue body in Markdown.
-```
-
-Valid statuses are `open`, `closed`, and `archived`. Archived remains on disk but is hidden from the default board. Unknown front matter keys are preserved. Malformed records are not overwritten.
-
-Links record an explicit one-issue-to-one-worktree association:
-
-```md
-+++
 id = "22222222-2222-4222-8222-222222222222"
-issue = "11111111-1111-4111-8111-111111111111"
+issue = 42
 worktree = "/home/zac/dev/projects/copse-worktrees/main"
 +++
 ```
 
-Branch names are derived from the linked worktree's Git metadata. Agent associations come from Herdr and are not persisted. GitHub Issues and Wayfinder files are read-only.
+`issue` is the GitHub issue number. Unknown front matter keys are preserved.
+Malformed records are not overwritten. Links from the old local tracker (UUID
+`issue` values) are rejected; delete them and relink by issue number.
+
+Branch names are derived from the linked worktree's Git metadata. Agent associations come from Herdr and are not persisted. GitHub Issues are read-only.
 
 ## Board
 
@@ -100,15 +90,15 @@ Forest layout is branch → Issue → Agent. The main branch is bold. Agent stat
 - blocked red `!`
 - unknown gray `·`
 
-Map layout is a selected Wayfinder map grouped into Frontier, Blocked, Assigned, and Done sections. Frontier means an open Issue with no open blocker and no assignee. The Map view shows Wayfinder Issues only. It does not add Worktree or Agent context. The map with the most open children is selected first; `Tab` cycles through other maps. Copse reads GitHub maps with `gh issue list` and local maps from `.copse/issues`. Local map children use `Parent: <uuid>` and `Blocked by: <uuid>, <uuid>` body lines. If GitHub is unavailable, local maps still load and the status bar marks GitHub stale.
+Map layout is a selected Wayfinder map grouped into Frontier, Blocked, Assigned, and Done sections. Frontier means an open Issue with no open blocker and no assignee. The Map view shows Wayfinder Issues only. It does not add Worktree or Agent context. The map with the most open children is selected first; `Tab` cycles through other maps. Copse reads GitHub maps with `gh issue list`. If GitHub is unavailable, the board keeps the last good data and the status bar marks GitHub stale.
 
 Both views can open a detail pane for the selected Issue. Map details wrap the Issue body, include GitHub comments, and support `PgUp` / `PgDn` scrolling.
 
 ## Refresh
 
 - Load all data on startup.
-- Poll Herdr and local Git/`.copse` every 2 seconds.
-- Poll GitHub Issues and Wayfinder every 30 seconds. Local maps refresh with the local tracker poll.
+- Poll worktrees, links, and Herdr every 2 seconds.
+- Poll GitHub Issues and Wayfinder every 30 seconds.
 - `r` forces an immediate refresh.
 - Keep the last good data when a source fails and show a stale indicator. If Herdr is unavailable, the board shows without live agent state.
 
@@ -122,16 +112,17 @@ cargo fmt
 cargo clippy -- -D warnings
 ```
 
-Tests cover tracker parsing, repository discovery, Herdr snapshot parsing, forest building, and board interaction.
+Tests cover link parsing, repository discovery, Herdr snapshot parsing, forest building, and board interaction.
 
 ## Acceptance
 
 - Starts in a nested directory and shows the containing worktree.
 - Started in a linked worktree shows the same board and all worktrees.
-- Missing `.copse` starts without issues and does not create files until the first write.
+- Missing `.copse` starts with worktrees only and does not create files.
 - Outside a Git worktree prints an error and exits.
 - Forest shows branches, linked Issues, and Agents with correct statuses and colors.
-- Map shows GitHub and local Wayfinder Issues grouped by frontier state and keeps map order within each section.
+- Map shows GitHub Wayfinder Issues grouped by frontier state and keeps map order within each section.
+- Issues tab shows every GitHub Issue grouped by frontier state.
 - Keys and mouse work as listed, and refresh intervals behave as above.
 
 ## Stack

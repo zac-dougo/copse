@@ -1,28 +1,24 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
-use uuid::Uuid;
 
 use crate::forest::{AgentNode, status_badge};
-use crate::github::{FrontierState, GitHubIssue, IssueState, classify_issue};
+use crate::github::{FrontierState, GitHubIssue, classify_issue};
 use crate::herdr::{Agent, Snapshot};
-use crate::tracker::{Issue, Status};
+use crate::tracker::Link;
 
 #[derive(Debug, Clone)]
 pub struct IssueRow {
-    pub issue: Issue,
+    pub issue: GitHubIssue,
     pub state: FrontierState,
-    pub blockers: Vec<Uuid>,
     pub linked: bool,
     pub agent: Option<AgentNode>,
-    pub number: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,8 +50,7 @@ impl IssuesData {
             .into_iter()
             .map(|state| {
                 let mut v = map.remove(&state).unwrap_or_default();
-                // Already sorted by number in build, but ensure
-                v.sort_by_key(|r| r.number);
+                v.sort_by_key(|r| r.issue.number);
                 (state, v)
             })
             .collect()
@@ -70,67 +65,26 @@ impl IssuesData {
             FrontierState::Done,
         ] {
             let mut v: Vec<&IssueRow> = self.rows.iter().filter(|r| r.state == state).collect();
-            v.sort_by_key(|r| r.number);
+            v.sort_by_key(|r| r.issue.number);
             ordered.extend(v);
         }
         ordered
     }
 }
 
-fn issue_labels(issue: &Issue) -> Vec<String> {
-    issue
-        .extra
-        .get("labels")
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(toml::Value::as_str)
-        .map(str::to_string)
-        .collect()
-}
-
-fn parse_uuid_references(body: &str) -> Vec<Uuid> {
-    body.lines()
-        .take(12)
-        .filter_map(|line| {
-            let lower = line.to_ascii_lowercase();
-            lower
-                .find("blocked by:")
-                .map(|index| &line[index + "blocked by:".len()..])
-        })
-        .flat_map(|value| value.split(|ch: char| ch == ',' || ch.is_whitespace()))
-        .filter_map(|part| {
-            Uuid::parse_str(part.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-')).ok()
-        })
-        .collect()
-}
-
 pub fn build_issues_data(
-    mut issues: Vec<Issue>,
-    links: Vec<crate::tracker::Link>,
+    mut issues: Vec<GitHubIssue>,
+    links: Vec<Link>,
     snapshot: &Snapshot,
 ) -> IssuesData {
-    // Sort issues by id for stable number assignment, as done in github.rs
-    issues.sort_by_key(|issue| issue.id);
+    // GitHub numbers are the stable identity; sort for deterministic rows.
+    issues.sort_by_key(|issue| issue.number);
 
-    let numbers: HashMap<Uuid, u64> = issues
-        .iter()
-        .enumerate()
-        .map(|(idx, issue)| (issue.id, idx as u64 + 1))
-        .collect();
+    let linked_numbers: HashSet<u64> = links.iter().map(|link| link.issue).collect();
 
-    let by_id: HashMap<Uuid, &Issue> = issues.iter().map(|issue| (issue.id, issue)).collect();
-
-    let linked_ids: HashSet<Uuid> = links.iter().map(|link| link.issue).collect();
-
-    // Map worktree path to agents, similar to forest
-    let _worktrees: Vec<PathBuf> = Vec::new();
-    // We don't have worktrees here, but we can map via link.worktree string to agents
-    // Instead, build a map from worktree path string to agents
     let mut agents_by_wt: HashMap<String, Vec<Agent>> = HashMap::new();
     for agent in &snapshot.agents {
         if let Some(cwd) = agent.foreground_cwd.as_ref().or(agent.cwd.as_ref()) {
-            // Find the link worktree that is prefix of cwd
             for link in &links {
                 if cwd.starts_with(&link.worktree) {
                     agents_by_wt
@@ -141,53 +95,16 @@ pub fn build_issues_data(
             }
         }
     }
-    // For more accurate mapping, also consider exact worktree path
-    // If no links, agents won't be mapped; that's fine for now
 
     let mut rows = Vec::new();
     for issue in &issues {
-        let blockers = parse_uuid_references(&issue.body)
-            .into_iter()
-            .filter(|id| {
-                by_id
-                    .get(id)
-                    .map(|blocker| blocker.status != Status::Closed)
-                    .unwrap_or(true)
-            })
-            .collect::<Vec<_>>();
+        let is_linked = linked_numbers.contains(&issue.number);
+        let state = classify_issue(issue);
 
-        let is_linked = linked_ids.contains(&issue.id);
-        let number = numbers[&issue.id];
-
-        // Build a synthetic GitHubIssue for classification, as done in github.rs
-        let github_issue = GitHubIssue {
-            number,
-            title: issue.title.clone(),
-            state: match issue.status {
-                Status::Open => IssueState::Open,
-                Status::Closed | Status::Archived => IssueState::Closed,
-            },
-            body: issue.body.clone(),
-            comments: Vec::new(),
-            labels: issue_labels(issue),
-            assignees: if is_linked {
-                vec!["linked".to_string()]
-            } else {
-                Vec::new()
-            },
-            open_blockers: blockers
-                .iter()
-                .filter_map(|uuid| numbers.get(uuid).copied())
-                .collect(),
-        };
-        let state = classify_issue(&github_issue);
-
-        // Find agent for this issue if linked
         let agent = if is_linked {
-            // Find link for this issue
             links
                 .iter()
-                .find(|link| link.issue == issue.id)
+                .find(|link| link.issue == issue.number)
                 .and_then(|link| agents_by_wt.get(&link.worktree))
                 .and_then(|agents| agents.first())
                 .map(|agent| {
@@ -205,15 +122,12 @@ pub fn build_issues_data(
         rows.push(IssueRow {
             issue: issue.clone(),
             state,
-            blockers,
             linked: is_linked,
             agent,
-            number,
         });
     }
 
-    // Sort rows by number (which is already UUID sort order, but keep for safety)
-    rows.sort_by_key(|r| r.number);
+    rows.sort_by_key(|r| r.issue.number);
 
     IssuesData { rows }
 }
@@ -288,7 +202,7 @@ impl<'a> Widget for IssuesWidget<'a> {
                 // Find flat index for this row
                 let flat_idx = ordered
                     .iter()
-                    .position(|r| r.issue.id == row.issue.id)
+                    .position(|r| r.issue.number == row.issue.number)
                     .unwrap();
                 let is_selected = self.selected == Some(flat_idx);
                 write_row(area, y, row, is_selected, buf);
@@ -301,7 +215,7 @@ impl<'a> Widget for IssuesWidget<'a> {
                 area.x + 2,
                 footer_y,
                 &Line::from(Span::styled(
-                    "Read this as: every local issue, grouped by state.",
+                    "Read this as: every GitHub issue, grouped by state.",
                     Style::default().fg(Color::DarkGray),
                 )),
                 area.width.saturating_sub(2),
@@ -324,23 +238,26 @@ fn write_row(area: Rect, y: u16, row: &IssueRow, selected: bool, buf: &mut Buffe
 
     let labels = row
         .issue
-        .extra
-        .get("labels")
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(toml::Value::as_str)
+        .labels
+        .iter()
         .filter(|label| *label != "wayfinder:map")
         .collect::<Vec<_>>();
 
     let mut spans = vec![
         Span::styled(format!("  {} ", row_symbol(row.state)), style),
-        Span::styled(format!("#{} ", row.number), style),
+        Span::styled(format!("#{} ", row.issue.number), style),
         Span::styled(row.issue.title.clone(), style),
     ];
     if !labels.is_empty() {
         spans.push(Span::styled(
-            format!("  [{}]", labels.join(", ")),
+            format!(
+                "  [{}]",
+                labels
+                    .iter()
+                    .map(|l| l.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             if selected {
                 style.fg(Color::Black)
             } else {
@@ -348,12 +265,13 @@ fn write_row(area: Rect, y: u16, row: &IssueRow, selected: bool, buf: &mut Buffe
             },
         ));
     }
-    if !row.blockers.is_empty() {
+    if !row.issue.open_blockers.is_empty() {
         let blocker_text = format!(
             "  blocked by {}",
-            row.blockers
+            row.issue
+                .open_blockers
                 .iter()
-                .map(|id| id.to_string().chars().take(8).collect::<String>())
+                .map(|n| format!("#{n}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -439,27 +357,30 @@ fn row_symbol(state: FrontierState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::IssueState;
     use crate::herdr::{AgentStatus, Snapshot};
-    use crate::tracker::{Issue, Link, Status};
+    use crate::tracker::Link;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
-    use std::collections::HashMap;
     use uuid::Uuid;
 
-    fn test_issue(id: &str, title: &str, status: Status, body: &str) -> Issue {
-        Issue {
-            id: Uuid::parse_str(id).unwrap(),
+    fn test_issue(number: u64, title: &str, state: IssueState) -> GitHubIssue {
+        GitHubIssue {
+            number,
             title: title.to_string(),
-            status,
-            body: body.to_string(),
-            extra: HashMap::new(),
+            state,
+            body: String::new(),
+            comments: Vec::new(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            open_blockers: Vec::new(),
         }
     }
 
-    fn test_link(id: &str, issue: &str, worktree: &str) -> Link {
+    fn test_link(issue: u64, worktree: &str) -> Link {
         Link {
-            id: Uuid::parse_str(id).unwrap(),
-            issue: Uuid::parse_str(issue).unwrap(),
+            id: Uuid::new_v4(),
+            issue,
             worktree: worktree.to_string(),
             body: "".to_string(),
             extra: HashMap::new(),
@@ -482,92 +403,60 @@ mod tests {
 
     #[test]
     fn groups_every_issue_by_state() {
-        let id_frontier = "11111111-1111-4111-8111-111111111111";
-        let id_blocked = "22222222-2222-4222-8222-222222222222";
-        let id_assigned = "33333333-3333-4333-8333-333333333333";
-        let id_done = "44444444-4444-4444-8444-444444444444";
-        let id_blocker = "55555555-5555-4555-8555-555555555555";
-
-        let blocker = test_issue(id_blocker, "Blocker", Status::Open, "");
-        let frontier = test_issue(id_frontier, "Frontier", Status::Open, "");
-        let blocked = test_issue(
-            id_blocked,
-            "Blocked",
-            Status::Open,
-            &format!("Blocked by: {}", id_blocker),
-        );
-        let assigned = test_issue(id_assigned, "Assigned", Status::Open, "");
-        let done = test_issue(id_done, "Done", Status::Closed, "");
-
-        let link = test_link(
-            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            id_assigned,
-            "/tmp/repo",
-        );
+        let mut blocked = test_issue(2, "Blocked", IssueState::Open);
+        blocked.open_blockers = vec![5];
+        let mut assigned = test_issue(3, "Assigned", IssueState::Open);
+        assigned.assignees = vec!["zac".to_string()];
 
         let data = build_issues_data(
             vec![
-                frontier.clone(),
-                blocked.clone(),
-                assigned.clone(),
-                done.clone(),
-                blocker.clone(),
+                test_issue(1, "Frontier", IssueState::Open),
+                blocked,
+                assigned,
+                test_issue(4, "Done", IssueState::Closed),
+                test_issue(5, "Blocker", IssueState::Open),
             ],
-            vec![link],
+            vec![test_link(3, "/tmp/repo")],
             &Snapshot::default(),
         );
 
         let grouped = data.grouped();
-        let frontier_group = grouped
-            .iter()
-            .find(|(s, _)| *s == FrontierState::Frontier)
-            .unwrap();
-        assert!(
-            frontier_group
+        let titles = |state| {
+            grouped
+                .iter()
+                .find(|(s, _)| *s == state)
+                .unwrap()
                 .1
                 .iter()
-                .any(|r| r.issue.id == Uuid::parse_str(id_frontier).unwrap())
+                .map(|r| r.issue.title.as_str())
+                .collect::<Vec<_>>()
+        };
+        // Blocker itself is also frontier (open, unblocked, unassigned).
+        assert_eq!(titles(FrontierState::Frontier), vec!["Frontier", "Blocker"]);
+        assert_eq!(titles(FrontierState::Blocked), vec!["Blocked"]);
+        assert_eq!(titles(FrontierState::Assigned), vec!["Assigned"]);
+        assert_eq!(titles(FrontierState::Done), vec!["Done"]);
+    }
+
+    #[test]
+    fn linked_issue_carries_agent() {
+        let mut snapshot = Snapshot::default();
+        snapshot.agents = vec![test_agent("/tmp/repo")];
+        let data = build_issues_data(
+            vec![test_issue(3, "Assigned", IssueState::Open)],
+            vec![test_link(3, "/tmp/repo")],
+            &snapshot,
         );
-        // Blocker itself is also frontier (open, unblocked, unassigned) so it will be in frontier too
-        let blocked_group = grouped
-            .iter()
-            .find(|(s, _)| *s == FrontierState::Blocked)
-            .unwrap();
-        assert!(
-            blocked_group
-                .1
-                .iter()
-                .any(|r| r.issue.id == Uuid::parse_str(id_blocked).unwrap())
-        );
-        let assigned_group = grouped
-            .iter()
-            .find(|(s, _)| *s == FrontierState::Assigned)
-            .unwrap();
-        assert!(
-            assigned_group
-                .1
-                .iter()
-                .any(|r| r.issue.id == Uuid::parse_str(id_assigned).unwrap())
-        );
-        let done_group = grouped
-            .iter()
-            .find(|(s, _)| *s == FrontierState::Done)
-            .unwrap();
-        assert!(
-            done_group
-                .1
-                .iter()
-                .any(|r| r.issue.id == Uuid::parse_str(id_done).unwrap())
-        );
+        assert_eq!(data.rows.len(), 1);
+        assert!(data.rows[0].linked);
+        assert_eq!(data.rows[0].agent.as_ref().unwrap().agent.pane_id, "w1:p1");
     }
 
     #[test]
     fn renders_grouped_sections() {
-        let id1 = "11111111-1111-4111-8111-111111111111";
-        let id2 = "22222222-2222-4222-8222-222222222222";
         let issues = vec![
-            test_issue(id1, "Frontier Issue", Status::Open, ""),
-            test_issue(id2, "Done Issue", Status::Closed, ""),
+            test_issue(1, "Frontier Issue", IssueState::Open),
+            test_issue(2, "Done Issue", IssueState::Closed),
         ];
         let data = build_issues_data(issues, vec![], &Snapshot::default());
         let area = Rect::new(0, 0, 80, 20);
@@ -594,8 +483,7 @@ mod tests {
 
     #[test]
     fn selected_row_is_highlighted() {
-        let id1 = "11111111-1111-4111-8111-111111111111";
-        let issues = vec![test_issue(id1, "Issue", Status::Open, "")];
+        let issues = vec![test_issue(1, "Issue", IssueState::Open)];
         let data = build_issues_data(issues, vec![], &Snapshot::default());
         let area = Rect::new(0, 0, 80, 10);
         let mut buf = Buffer::empty(area);
@@ -604,8 +492,6 @@ mod tests {
             selected: Some(0),
         }
         .render(area, &mut buf);
-        // Selected row is at y=2 (header 0, blank 1, Frontier header 2, row 3?) Actually ISSUES header at y0, Frontier header at y1, row at y2
-        // Find row with Issue
         let y = (0..area.height)
             .find(|y| {
                 (0..area.width)

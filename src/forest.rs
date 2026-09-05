@@ -8,11 +8,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
-use uuid::Uuid;
 
 use crate::discovery::Worktree;
+use crate::github::{GitHubIssue, IssueState};
 use crate::herdr::{Agent, AgentStatus, Snapshot};
-use crate::tracker::{Issue, Status};
+use crate::tracker::Link;
 
 #[derive(Debug, Clone)]
 pub struct AgentNode {
@@ -23,7 +23,7 @@ pub struct AgentNode {
 
 #[derive(Debug, Clone)]
 pub struct IssueNode {
-    pub issue: Issue,
+    pub issue: GitHubIssue,
     pub agents: Vec<AgentNode>,
 }
 
@@ -67,47 +67,14 @@ pub fn branch_is_main(branch: &Option<String>) -> bool {
     }
 }
 
-fn parse_blocked_by(body: &str) -> Vec<Uuid> {
-    body.lines()
-        .take(12)
-        .filter_map(|line| {
-            let lower = line.to_ascii_lowercase();
-            lower
-                .find("blocked by:")
-                .map(|index| &line[index + "blocked by:".len()..])
-        })
-        .flat_map(|value| value.split(|ch: char| ch == ',' || ch.is_whitespace()))
-        .filter_map(|part| {
-            Uuid::parse_str(part.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-')).ok()
-        })
-        .collect()
-}
-
-fn has_map_label(issue: &Issue) -> bool {
-    issue
-        .extra
-        .get("labels")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str())
-        .any(|l| l == "wayfinder:map" || l == "spec")
-}
-
-fn parse_parent_id(body: &str) -> Option<Uuid> {
-    body.lines().take(12).find_map(|line| {
-        let lower = line.to_ascii_lowercase();
-        let value = lower.find("parent:").map(|idx| &line[idx + "parent:".len()..])?;
-        value.split_whitespace().find_map(|part| {
-            Uuid::parse_str(part.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-')).ok()
-        })
-    })
+fn has_map_label(issue: &GitHubIssue) -> bool {
+    issue.labels.iter().any(|l| l == "wayfinder:map")
 }
 
 pub fn build_forest(
     worktrees: Vec<Worktree>,
-    issues: Vec<Issue>,
-    links: Vec<crate::tracker::Link>,
+    issues: Vec<GitHubIssue>,
+    links: Vec<Link>,
     snapshot: &Snapshot,
 ) -> Forest {
     let mut wt_by_path: HashMap<PathBuf, Worktree> = HashMap::new();
@@ -115,13 +82,13 @@ pub fn build_forest(
         wt_by_path.insert(wt.path.clone(), wt.clone());
     }
 
-    let mut issue_by_id: HashMap<Uuid, Issue> = HashMap::new();
+    let mut issue_by_number: HashMap<u64, GitHubIssue> = HashMap::new();
     for issue in &issues {
-        issue_by_id.insert(issue.id, issue.clone());
+        issue_by_number.insert(issue.number, issue.clone());
     }
 
-    let mut wt_to_issue: HashMap<PathBuf, Uuid> = HashMap::new();
-    let mut issue_to_wt: HashMap<Uuid, PathBuf> = HashMap::new();
+    let mut wt_to_issue: HashMap<PathBuf, u64> = HashMap::new();
+    let mut issue_to_wt: HashMap<u64, PathBuf> = HashMap::new();
     // Sort links for deterministic winner when multiple links share a worktree and
     // have the same priority (e.g. two closed or two open). Without sorting,
     // read_dir hash order would make the winner nondeterministic.
@@ -132,18 +99,14 @@ pub fn build_forest(
         let should_insert = match wt_to_issue.get(&wt_path).cloned() {
             None => true,
             Some(existing_id) => {
-                let existing = issue_by_id.get(&existing_id);
-                let incoming = issue_by_id.get(&link.issue);
-                match (existing.map(|i| i.status), incoming.map(|i| i.status)) {
-                    // Prefer Open over Closed/Archived regardless of insertion order.
+                let existing = issue_by_number.get(&existing_id);
+                let incoming = issue_by_number.get(&link.issue);
+                match (existing.map(|i| i.state), incoming.map(|i| i.state)) {
+                    // Prefer Open over Closed regardless of insertion order.
                     // This fixes the main-worktree claim bug where a new open claim
                     // is hidden behind a stale closed link to the same worktree.
-                    (Some(Status::Closed) | Some(Status::Archived) | None, Some(Status::Open)) => {
-                        true
-                    }
-                    (Some(Status::Open), Some(Status::Closed) | Some(Status::Archived) | None) => {
-                        false
-                    }
+                    (Some(IssueState::Closed) | None, Some(IssueState::Open)) => true,
+                    (Some(IssueState::Open), Some(IssueState::Closed) | None) => false,
                     _ => false,
                 }
             }
@@ -218,9 +181,9 @@ pub fn build_forest(
             .unwrap_or_else(|| wt.path.display().to_string());
         let is_main = branch_is_main(&wt.branch);
 
-        let issue_node = if let Some(issue_id) = wt_to_issue.get(&wt.path) {
-            if let Some(issue) = issue_by_id.get(issue_id) {
-                linked_issue_ids.insert(*issue_id);
+        let issue_node = if let Some(issue_number) = wt_to_issue.get(&wt.path) {
+            if let Some(issue) = issue_by_number.get(issue_number) {
+                linked_issue_ids.insert(*issue_number);
                 let agents = agents_by_wt
                     .remove(&wt.path)
                     .unwrap_or_default()
@@ -253,38 +216,28 @@ pub fn build_forest(
         });
     }
 
-    // Build map set for frontier-derivation: only children of maps that are frontier
-    let map_ids: HashSet<Uuid> = issue_by_id.values().filter(|i| has_map_label(i)).map(|i| i.id).collect();
-
+    // Unlinked section: open, unblocked GitHub issues with no worktree link.
+    // Wayfinder maps are meta-issues shown in the Map view, not here.
     let mut unlinked_issues = Vec::new();
     for issue in issues {
-        if linked_issue_ids.contains(&issue.id) {
+        if linked_issue_ids.contains(&issue.number) {
             continue;
         }
-        if issue.status != Status::Open {
+        if issue.state != IssueState::Open {
             continue;
         }
-        let is_blocked = parse_blocked_by(&issue.body)
-            .into_iter()
-            .any(|id| issue_by_id.get(&id).is_some_and(|b| b.status != Status::Closed) || !issue_by_id.contains_key(&id));
-        if is_blocked {
+        if !issue.open_blockers.is_empty() {
             continue;
         }
-        // If maps exist, only keep issues that are children of a map (current frontier per map).
-        // This matches "get its issues from the current frontier in each map".
-        // When no maps exist (unit tests without parent links), fall back to open+unblocked.
-        if !map_ids.is_empty() {
-            let parent = parse_parent_id(&issue.body);
-            match parent {
-                Some(pid) if map_ids.contains(&pid) => {}
-                _ => continue,
-            }
+        if has_map_label(&issue) {
+            continue;
         }
         unlinked_issues.push(IssueNode {
             issue,
             agents: Vec::new(),
         });
     }
+    unlinked_issues.sort_by_key(|node| node.issue.number);
 
     Forest {
         branches,
@@ -296,7 +249,7 @@ pub struct ForestWidget<'a> {
     pub forest: &'a Forest,
     pub selected: Option<usize>,
     pub expanded_branches: Option<&'a HashSet<PathBuf>>,
-    pub expanded_issues: Option<&'a HashSet<Uuid>>,
+    pub expanded_issues: Option<&'a HashSet<u64>>,
 }
 
 impl<'a> Widget for ForestWidget<'a> {
@@ -401,7 +354,7 @@ impl<'a> Widget for ForestWidget<'a> {
             // Respect collapsed state: if branch is collapsed, skip issue/agent rendering
             let branch_expanded = self
                 .expanded_branches
-                .map_or(true, |set| set.contains(&branch.worktree.path));
+                .is_none_or(|set| set.contains(&branch.worktree.path));
             if !branch_expanded {
                 if y < max_y {
                     y += 1;
@@ -450,7 +403,7 @@ impl<'a> Widget for ForestWidget<'a> {
 
                 let issue_expanded = self
                     .expanded_issues
-                    .map_or(true, |set| set.contains(&issue_node.issue.id));
+                    .is_none_or(|set| set.contains(&issue_node.issue.number));
                 if !issue_expanded {
                     if y < max_y {
                         // still need to handle agent placeholder? No, collapsed issue hides agents
@@ -631,11 +584,11 @@ pub fn render_markdown_to_text(md: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::{GitHubComment, IssueState};
     use crate::herdr::{AgentStatus, Snapshot};
-    use crate::tracker::{Issue, Link, Status};
+    use crate::tracker::Link;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
-    use std::collections::HashMap;
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -650,20 +603,23 @@ mod tests {
         }
     }
 
-    fn test_issue(id: &str, title: &str, status: Status) -> Issue {
-        Issue {
-            id: Uuid::parse_str(id).unwrap(),
+    fn test_issue(number: u64, title: &str, state: IssueState) -> GitHubIssue {
+        GitHubIssue {
+            number,
             title: title.to_string(),
-            status,
+            state,
             body: format!("Body for {title}"),
-            extra: HashMap::new(),
+            comments: Vec::new(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            open_blockers: Vec::new(),
         }
     }
 
-    fn test_link(id: &str, issue: &str, worktree: &str) -> Link {
+    fn test_link(issue: u64, worktree: &str) -> Link {
         Link {
-            id: Uuid::parse_str(id).unwrap(),
-            issue: Uuid::parse_str(issue).unwrap(),
+            id: Uuid::new_v4(),
+            issue,
             worktree: worktree.to_string(),
             body: "".to_string(),
             extra: HashMap::new(),
@@ -700,16 +656,8 @@ mod tests {
     #[test]
     fn links_issue_to_worktree() {
         let wt = test_worktree("/tmp/repo", "main");
-        let issue = test_issue(
-            "11111111-1111-4111-8111-111111111111",
-            "Test Issue",
-            Status::Open,
-        );
-        let link = test_link(
-            "22222222-2222-4222-8222-222222222222",
-            "11111111-1111-4111-8111-111111111111",
-            "/tmp/repo",
-        );
+        let issue = test_issue(42, "Test Issue", IssueState::Open);
+        let link = test_link(42, "/tmp/repo");
         let forest = build_forest(vec![wt], vec![issue], vec![link], &Snapshot::default());
         assert_eq!(forest.branches.len(), 1);
         assert!(forest.branches[0].issue.is_some());
@@ -721,23 +669,19 @@ mod tests {
     }
 
     #[test]
+    fn link_to_missing_issue_leaves_branch_empty() {
+        let wt = test_worktree("/tmp/repo", "main");
+        let link = test_link(99, "/tmp/repo");
+        let forest = build_forest(vec![wt], vec![], vec![link], &Snapshot::default());
+        assert!(forest.branches[0].issue.is_none());
+    }
+
+    #[test]
     fn unlinked_issue_shown_separately() {
         let wt = test_worktree("/tmp/repo", "main");
-        let issue1 = test_issue(
-            "11111111-1111-4111-8111-111111111111",
-            "Linked",
-            Status::Open,
-        );
-        let issue2 = test_issue(
-            "33333333-3333-4333-8333-333333333333",
-            "Unlinked",
-            Status::Open,
-        );
-        let link = test_link(
-            "22222222-2222-4222-8222-222222222222",
-            "11111111-1111-4111-8111-111111111111",
-            "/tmp/repo",
-        );
+        let issue1 = test_issue(1, "Linked", IssueState::Open);
+        let issue2 = test_issue(2, "Unlinked", IssueState::Open);
+        let link = test_link(1, "/tmp/repo");
         let forest = build_forest(
             vec![wt],
             vec![issue1, issue2],
@@ -753,18 +697,33 @@ mod tests {
     }
 
     #[test]
+    fn unlinked_hides_closed_blocked_and_maps() {
+        let wt = test_worktree("/tmp/repo", "main");
+        let mut blocked = test_issue(2, "Blocked", IssueState::Open);
+        blocked.open_blockers = vec![3];
+        let mut map = test_issue(4, "Map", IssueState::Open);
+        map.labels = vec!["wayfinder:map".to_string()];
+        let issues = vec![
+            test_issue(1, "Frontier", IssueState::Open),
+            blocked,
+            test_issue(3, "Blocker", IssueState::Open),
+            map,
+            test_issue(5, "Closed", IssueState::Closed),
+        ];
+        let forest = build_forest(vec![wt], issues, vec![], &Snapshot::default());
+        let titles: Vec<&str> = forest
+            .unlinked_issues
+            .iter()
+            .map(|n| n.issue.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Frontier", "Blocker"]);
+    }
+
+    #[test]
     fn agent_mapped_to_linked_issue() {
         let wt = test_worktree("/tmp/repo", "main");
-        let issue = test_issue(
-            "11111111-1111-4111-8111-111111111111",
-            "Issue",
-            Status::Open,
-        );
-        let link = test_link(
-            "22222222-2222-4222-8222-222222222222",
-            "11111111-1111-4111-8111-111111111111",
-            "/tmp/repo",
-        );
+        let issue = test_issue(7, "Issue", IssueState::Open);
+        let link = test_link(7, "/tmp/repo");
         let mut snap = Snapshot::default();
         snap.agents = vec![test_agent("w1:p1", AgentStatus::Working, "/tmp/repo")];
         let forest = build_forest(vec![wt], vec![issue], vec![link], &snap);
@@ -796,16 +755,8 @@ mod tests {
     #[test]
     fn render_forest_contains_expected_text() {
         let wt = test_worktree("/tmp/repo", "main");
-        let issue = test_issue(
-            "11111111-1111-4111-8111-111111111111",
-            "My Issue",
-            Status::Open,
-        );
-        let link = test_link(
-            "22222222-2222-4222-8222-222222222222",
-            "11111111-1111-4111-8111-111111111111",
-            "/tmp/repo",
-        );
+        let issue = test_issue(7, "My Issue", IssueState::Open);
+        let link = test_link(7, "/tmp/repo");
         let mut snap = Snapshot::default();
         snap.agents = vec![test_agent("w5:p1", AgentStatus::Working, "/tmp/repo")];
         let forest = build_forest(vec![wt], vec![issue], vec![link], &snap);
@@ -852,33 +803,16 @@ mod tests {
 
     #[test]
     fn multiple_links_to_main_prefers_open_issue() {
-        // Repro for main-worktree claim bug: main has 3 closed links + 1 open claimed.
-        // Current code picks last-inserted link (closed) over open, hiding the claim.
+        // Main has a stale closed link plus a fresh open claim: the open
+        // claimed issue wins the branch regardless of link order.
         let wt = test_worktree("/tmp/repo", "main");
-        let closed_issue = test_issue(
-            "11111111-1111-4111-8111-111111111111",
-            "Closed old",
-            Status::Closed,
-        );
-        let open_issue = test_issue(
-            "33333333-3333-4333-8333-333333333333",
-            "Open claimed",
-            Status::Open,
-        );
-        // closed link last -> current buggy pick is closed
-        let open_link = test_link(
-            "22222222-2222-4222-8222-222222222222",
-            "33333333-3333-4333-8333-333333333333",
-            "/tmp/repo",
-        );
-        let closed_link = test_link(
-            "44444444-4444-4444-8444-444444444444",
-            "11111111-1111-4111-8111-111111111111",
-            "/tmp/repo",
-        );
+        let closed_issue = test_issue(1, "Closed old", IssueState::Closed);
+        let open_issue = test_issue(2, "Open claimed", IssueState::Open);
+        let open_link = test_link(2, "/tmp/repo");
+        let closed_link = test_link(1, "/tmp/repo");
         let mut snap = Snapshot::default();
         snap.agents = vec![test_agent("w1:p1", AgentStatus::Working, "/tmp/repo")];
-        // order: open first, closed last => buggy HashMap picks closed
+        // Order: open first, closed last, so a naive last-wins pick is closed.
         let forest = build_forest(
             vec![wt],
             vec![closed_issue, open_issue],
@@ -886,35 +820,16 @@ mod tests {
             &snap,
         );
         let branch_issue = forest.branches[0].issue.as_ref().unwrap();
-        // Forest should show the open claimed issue under main, with agent attached
         assert_eq!(branch_issue.issue.title, "Open claimed");
         assert_eq!(branch_issue.agents.len(), 1);
         assert_eq!(branch_issue.agents[0].agent.pane_id, "w1:p1");
-        // closed issue should be unlinked? but not under branch
-        assert!(
-            forest.unlinked_issues.is_empty()
-                || forest
-                    .unlinked_issues
-                    .iter()
-                    .any(|n| n.issue.title == "Closed old")
-                    == false
-                || true
-        );
     }
 
     #[test]
     fn selected_forest_row_is_highlighted() {
         let wt = test_worktree("/tmp/repo", "main");
-        let issue = test_issue(
-            "11111111-1111-4111-8111-111111111111",
-            "My Issue",
-            Status::Open,
-        );
-        let link = test_link(
-            "22222222-2222-4222-8222-222222222222",
-            "11111111-1111-4111-8111-111111111111",
-            "/tmp/repo",
-        );
+        let issue = test_issue(7, "My Issue", IssueState::Open);
+        let link = test_link(7, "/tmp/repo");
         let mut snap = Snapshot::default();
         snap.agents = vec![test_agent("w1:p1", AgentStatus::Working, "/tmp/repo")];
         let forest = build_forest(vec![wt], vec![issue], vec![link], &snap);
@@ -974,5 +889,28 @@ mod tests {
     fn forest_empty() {
         let forest = build_forest(vec![], vec![], vec![], &Snapshot::default());
         assert!(forest.is_empty());
+    }
+
+    #[test]
+    fn comments_do_not_break_issue_nodes() {
+        // GitHub issues carry comments; forest nodes must hold them through.
+        let wt = test_worktree("/tmp/repo", "main");
+        let mut issue = test_issue(7, "Discussed", IssueState::Open);
+        issue.comments = vec![GitHubComment {
+            author: "zac".to_string(),
+            body: "looks good".to_string(),
+        }];
+        let link = test_link(7, "/tmp/repo");
+        let forest = build_forest(vec![wt], vec![issue], vec![link], &Snapshot::default());
+        assert_eq!(
+            forest.branches[0]
+                .issue
+                .as_ref()
+                .unwrap()
+                .issue
+                .comments
+                .len(),
+            1
+        );
     }
 }

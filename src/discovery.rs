@@ -35,9 +35,8 @@ pub struct BoardRepository {
     pub current_worktree_path: PathBuf,
     /// All worktrees in the repo.
     pub worktrees: Vec<Worktree>,
-    /// Primary-owned tracker dir.
+    /// Primary-owned tracker dir (worktree links only; issues live on GitHub).
     pub copse_dir: PathBuf,
-    pub issues_dir: PathBuf,
     pub links_dir: PathBuf,
     pub is_copse_present: bool,
 }
@@ -213,7 +212,6 @@ pub fn discover(cwd: &Path) -> Result<BoardRepository, DiscoveryError> {
     let _primary_in_list = worktrees.iter().find(|wt| wt.path == primary_path);
 
     let copse_dir = primary_path.join(".copse");
-    let issues_dir = copse_dir.join("issues");
     let links_dir = copse_dir.join("links");
     let is_copse_present = copse_dir.exists();
 
@@ -222,7 +220,6 @@ pub fn discover(cwd: &Path) -> Result<BoardRepository, DiscoveryError> {
         current_worktree_path,
         worktrees,
         copse_dir,
-        issues_dir,
         links_dir,
         is_copse_present,
     })
@@ -324,7 +321,7 @@ mod tests {
         init_repo(&repo);
         let board = discover(&repo).unwrap();
         assert!(!board.is_copse_present);
-        fs::create_dir_all(repo.join(".copse/issues")).unwrap();
+        fs::create_dir_all(repo.join(".copse/links")).unwrap();
         let board2 = discover(&repo).unwrap();
         assert!(board2.is_copse_present);
     }
