@@ -13,7 +13,7 @@ A Herdr-recognized coding-agent process in the active local Herdr session. Copse
 _Avoid_: Worker, session
 
 **Issue**:
-A local record of work in `.copse/issues/*.md` (and, for GitHub-backed repos, a GitHub Issue). Every Issue has an `id`, `title`, `status` (`open`/`closed`/`archived`), and optional triage labels.
+A GitHub Issue. Every Issue has a `number`, `title`, `state` (`open`/`closed`), and optional labels and assignees.
 _Avoid_: Ticket, task
 
 **Frontier**:
@@ -21,19 +21,19 @@ An open, unblocked, unassigned Issue. It is ready to be claimed.
 _Avoid_: Ready, todo
 
 **Blocked**:
-An open Issue that has at least one open blocker referenced in its `Blocked by` line.
+An open Issue that has at least one open blocker (native GitHub dependency or a `Blocked by: #<n>` line).
 _Avoid_: Waiting
 
 **Assigned**:
-An open Issue that is linked to a worktree via `.copse/links/` (or, on GitHub, assigned to a user) and has no open blockers. An Agent may be working on it.
+An open Issue that is linked to a worktree via `.copse/links/` or assigned to a user, and has no open blockers. An Agent may be working on it.
 _Avoid_: Working, claimed, in-progress
 
 **Done**:
-A closed or archived Issue.
+A closed Issue.
 _Avoid_: Completed, resolved
 
 **Link**:
-An explicit association between a worktree, an issue, and optionally an agent.
+An explicit association between a worktree and a GitHub issue number, stored in `.copse/links/`.
 _Avoid_: Inferred assignment, convention
 
 **Wayfinder map**:
